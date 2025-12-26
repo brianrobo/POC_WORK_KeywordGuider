@@ -4,20 +4,9 @@
 # Version: 0.3.2 (2025-12-26)
 #
 # Release Notes (v0.3.2)
-# 1) Vendor CRUD 추가 (+ / - / R)
-#    - Vendor 추가/삭제/이름변경 지원
-#    - DB + issues_config.json(vendor scoped) 동기화
-#    - 최소 1개 vendor 유지
-#
-# 2) Keyword Drag & Drop 정렬 지원
-#    - Treeview에서 드래그로 순서 변경
-#    - Filter(검색) 적용 중에는 reorder 비활성화(안전)
-#
-# 3) Keyword Filter(검색) 추가
-#    - Summary / Joined Keyword / Description 대상으로 부분 문자열 검색
-#
-# 4) Keyword에 안정적인 _id(uuid) 부여
-#    - Treeview iid를 index 대신 _id로 사용 (필터/정렬/선택 안정)
+# 1) KeywordDialog Preview UX 개선
+#    - Preview는 전체 문자열을 유지하되, 창 가로 폭 초과 시 자동 줄바꿈(wrap)
+#    - Preview 영역은 고정된 표시 줄 수(최대 N줄)로만 보여주고, 길면 스크롤로 확인
 #
 # Existing Features (유지)
 # - Vendor별 Issue 관리 + Vendor별 Delimiter 저장
@@ -29,7 +18,6 @@
 
 import json
 import re
-import uuid
 from pathlib import Path
 import tkinter as tk
 from tkinter import ttk, messagebox, simpledialog
@@ -43,7 +31,7 @@ UI_STATE_PATH = BASE_DIR / "ui_state.json"
 ISSUES_PATH = BASE_DIR / "issues_config.json"
 
 PLACEHOLDER_RE = re.compile(r"\{([A-Za-z0-9_]+)\}")
-DEFAULT_GEOMETRY = "1300x820"
+DEFAULT_GEOMETRY = "1250x760"
 
 KEYWORD_COLS = ("summary", "keyword", "preview", "info", "copy")
 DEFAULT_KEYWORD_COL_WIDTHS = {
@@ -59,6 +47,9 @@ DEFAULT_PARAM_COL_WIDTHS = {"pname": 140, "pval": 280}
 
 COPY_FEEDBACK_MS = 900
 DEFAULT_DELIMITER = ";"
+
+# KeywordDialog Preview UI
+PREVIEW_MAX_LINES = 4  # 고정 표시 줄 수(원하시면 3~6 정도로 조정)
 
 
 # ------------------------------------------------------------
@@ -110,7 +101,7 @@ def _clean_str_list_keep_order(items):
     return out
 
 
-def ensure_issue_config_vendor_scoped(cfg: dict, vendors):
+def ensure_issue_config_vendor_scoped(cfg: dict, vendors: list[str]):
     """
     issues_config.json (vendor-scoped) schema:
       {
@@ -146,6 +137,7 @@ def ensure_issue_config_vendor_scoped(cfg: dict, vendors):
         if not isinstance(issues, list) or not issues:
             vobj["issues"] = default_issues()
         else:
+            # keep order, unique (avoid duplicate issue names)
             seen = set()
             cleaned = []
             for it in issues:
@@ -160,32 +152,14 @@ def ensure_issue_config_vendor_scoped(cfg: dict, vendors):
         delim = str(delim) if delim is not None else DEFAULT_DELIMITER
         vobj["delimiter"] = delim
 
-    # purge vendors not in db (optional safety)
-    for k in list(cfg["vendors"].keys()):
-        if k not in vendors:
-            del cfg["vendors"][k]
-
     return cfg
-
-
-def _ensure_kw_id(kw: dict) -> dict:
-    if not isinstance(kw, dict):
-        return {}
-    if "_id" not in kw or not str(kw.get("_id", "")).strip():
-        kw["_id"] = str(uuid.uuid4())
-    return kw
 
 
 def normalize_keywords(lst):
     """
     Normalize keyword list items to dict:
-      legacy:
-        {"summary":..., "desc":..., "text":...}
-      new:
-        {"summary":..., "desc":..., "parts":[...]}
-      plus stable id:
-        "_id": uuid string
-
+      {"summary":..., "desc":..., "text":...}  (legacy)
+      {"summary":..., "desc":..., "parts":[...]} (new)
     Backward compatible:
       - string -> {"text": str, "summary":"", "desc":""}
       - {"text","desc"} / {"text","description"}
@@ -196,8 +170,7 @@ def normalize_keywords(lst):
         if isinstance(item, str):
             t = item.strip()
             if t:
-                kw = {"text": t, "summary": "", "desc": ""}
-                out.append(_ensure_kw_id(kw))
+                out.append({"text": t, "summary": "", "desc": ""})
             continue
 
         if not isinstance(item, dict):
@@ -209,14 +182,12 @@ def normalize_keywords(lst):
         if "parts" in item and isinstance(item.get("parts"), list):
             parts = _clean_str_list_keep_order(item.get("parts"))
             if parts:
-                kw = {"parts": parts, "summary": summary, "desc": desc, "_id": item.get("_id", "")}
-                out.append(_ensure_kw_id(kw))
+                out.append({"parts": parts, "summary": summary, "desc": desc})
                 continue
 
         text = str(item.get("text", "")).strip()
         if text:
-            kw = {"text": text, "summary": summary, "desc": desc, "_id": item.get("_id", "")}
-            out.append(_ensure_kw_id(kw))
+            out.append({"text": text, "summary": summary, "desc": desc})
 
     return out
 
@@ -229,7 +200,7 @@ def keyword_joined_template(kw: dict, delimiter: str) -> str:
     return str((kw or {}).get("text", "")).strip()
 
 
-def keyword_parts_from_kw(kw: dict, delimiter: str):
+def keyword_parts_from_kw(kw: dict, delimiter: str) -> list[str]:
     delimiter = DEFAULT_DELIMITER if delimiter is None else str(delimiter)
 
     if isinstance(kw, dict) and isinstance(kw.get("parts"), list) and kw.get("parts"):
@@ -249,6 +220,12 @@ def keyword_parts_from_kw(kw: dict, delimiter: str):
 class KeywordDialog(tk.Toplevel):
     """
     Keyword input supports multiple parts via dynamic +/- rows.
+
+    Preview UX:
+      - Full preview shown (no truncation)
+      - Wrap to next line when dialog width is exceeded
+      - Show only up to PREVIEW_MAX_LINES lines in view (fixed height),
+        with vertical scrollbar to inspect long preview.
     """
     def __init__(self, parent, title, init=None, delimiter=";"):
         super().__init__(parent)
@@ -271,6 +248,7 @@ class KeywordDialog(tk.Toplevel):
 
         ttk.Label(frm, text=f"Keyword Parts (구분자: '{self.delimiter}')").grid(row=2, column=0, sticky="w")
 
+        # Parts area
         parts_box = ttk.Frame(frm)
         parts_box.grid(row=3, column=0, sticky="ew", pady=(2, 6))
         parts_box.columnconfigure(0, weight=1)
@@ -283,8 +261,26 @@ class KeywordDialog(tk.Toplevel):
         add_btn_row.grid(row=1, column=0, sticky="w", pady=(6, 0))
         ttk.Button(add_btn_row, text="+ Add Part", command=self._add_part_row).pack(side=tk.LEFT)
 
-        ttk.Label(frm, text="Joined Keyword Preview").grid(row=4, column=0, sticky="w", pady=(6, 0))
-        ttk.Label(frm, textvariable=self.var_join_preview).grid(row=5, column=0, sticky="w", pady=(2, 10))
+        # Preview
+        ttk.Label(frm, text="Joined Keyword Preview (auto wrap, scrollable)").grid(row=4, column=0, sticky="w", pady=(6, 0))
+
+        preview_box = ttk.Frame(frm)
+        preview_box.grid(row=5, column=0, sticky="ew", pady=(2, 10))
+        preview_box.columnconfigure(0, weight=1)
+
+        self.preview_text = tk.Text(
+            preview_box,
+            height=PREVIEW_MAX_LINES,
+            wrap="word",          # 가로 넘으면 자동 줄바꿈
+            relief="solid",
+            borderwidth=1
+        )
+        self.preview_text.grid(row=0, column=0, sticky="ew")
+        self.preview_text.configure(state="disabled")
+
+        self.preview_scroll = ttk.Scrollbar(preview_box, orient="vertical", command=self.preview_text.yview)
+        self.preview_scroll.grid(row=0, column=1, sticky="ns", padx=(6, 0))
+        self.preview_text.configure(yscrollcommand=self.preview_scroll.set)
 
         ttk.Label(frm, text="Description (긴 설명, Info 팝업으로 표시)").grid(row=6, column=0, sticky="w")
         self.txt_desc = tk.Text(frm, height=10, wrap="word")
@@ -299,6 +295,7 @@ class KeywordDialog(tk.Toplevel):
         frm.columnconfigure(0, weight=1)
         frm.rowconfigure(7, weight=1)
 
+        # Build initial part rows
         initial_parts = keyword_parts_from_kw(init, self.delimiter)
         if not initial_parts:
             initial_parts = [""]
@@ -323,6 +320,7 @@ class KeywordDialog(tk.Toplevel):
         if initial_text:
             ent.insert(0, str(initial_text))
 
+        # remove button (but keep at least one row)
         btn = ttk.Button(row, text="-", width=3, command=lambda r=row: self._remove_part_row(r))
         btn.pack(side=tk.LEFT, padx=(6, 0))
 
@@ -332,6 +330,7 @@ class KeywordDialog(tk.Toplevel):
     def _remove_part_row(self, row_frame):
         children = [w for w in self.parts_container.winfo_children() if isinstance(w, ttk.Frame)]
         if len(children) <= 1:
+            # keep at least one row; just clear
             try:
                 ent = row_frame.winfo_children()[0]
                 if isinstance(ent, ttk.Entry):
@@ -347,7 +346,7 @@ class KeywordDialog(tk.Toplevel):
             pass
         self._update_preview()
 
-    def _get_parts(self):
+    def _get_parts(self) -> list[str]:
         parts = []
         for row in self.parts_container.winfo_children():
             if not isinstance(row, ttk.Frame):
@@ -362,9 +361,23 @@ class KeywordDialog(tk.Toplevel):
                     parts.append(s)
         return parts
 
+    def _set_preview_text(self, text: str):
+        self.preview_text.configure(state="normal")
+        self.preview_text.delete("1.0", "end")
+        self.preview_text.insert("1.0", text or "")
+        self.preview_text.configure(state="disabled")
+
+        # 항상 맨 위부터 보이게(원하면 end로 변경 가능)
+        try:
+            self.preview_text.yview_moveto(0.0)
+        except Exception:
+            pass
+
     def _update_preview(self):
         parts = self._get_parts()
-        self.var_join_preview.set(self.delimiter.join(parts))
+        joined = self.delimiter.join(parts)
+        self.var_join_preview.set(joined)   # 내부 상태는 유지
+        self._set_preview_text(joined)      # UI는 wrap+scroll
 
     def _ok(self):
         parts = self._get_parts()
@@ -445,17 +458,12 @@ class KeywordGuideApp(tk.Tk):
         self.detail_var = tk.StringVar()
         self.status_var = tk.StringVar(value="Ready")
         self.delim_var = tk.StringVar(value=DEFAULT_DELIMITER)
-        self.filter_var = tk.StringVar(value="")
 
         self._param_editor = None
         self._param_editing = None
 
         self._copy_feedback_after_id = None
         self._copy_feedback_row = None
-
-        # Drag&Drop reorder state
-        self._drag_kw_active = False
-        self._drag_kw_src_iid = None
 
         self.geometry(self.ui_state.get("geometry", DEFAULT_GEOMETRY))
         self._build_ui()
@@ -483,20 +491,20 @@ class KeywordGuideApp(tk.Tk):
     # --------------------------------------------------------
     # Config helpers
     # --------------------------------------------------------
-    def _get_vendor_cfg(self, vendor: str):
+    def _get_vendor_cfg(self, vendor: str) -> dict:
         return self.issue_cfg.get("vendors", {}).get(vendor, {}) if vendor else {}
 
-    def _get_vendor_issues(self, vendor: str):
+    def _get_vendor_issues(self, vendor: str) -> list[str]:
         vobj = self._get_vendor_cfg(vendor)
         issues = vobj.get("issues", [])
         return list(issues) if isinstance(issues, list) else []
 
-    def _set_vendor_issues(self, vendor: str, issues):
+    def _set_vendor_issues(self, vendor: str, issues: list[str]):
         self.issue_cfg.setdefault("vendors", {})
         self.issue_cfg["vendors"].setdefault(vendor, {})
         self.issue_cfg["vendors"][vendor]["issues"] = issues
 
-    def _get_vendor_delimiter(self, vendor: str):
+    def _get_vendor_delimiter(self, vendor: str) -> str:
         vobj = self._get_vendor_cfg(vendor)
         delim = vobj.get("delimiter", DEFAULT_DELIMITER)
         if delim is None:
@@ -595,16 +603,9 @@ class KeywordGuideApp(tk.Tk):
         left.grid(row=0, column=0, sticky="ns")
 
         ttk.Label(left, text="Vendor").pack(anchor="w")
-        vendor_row = ttk.Frame(left)
-        vendor_row.pack(fill=tk.X)
-
-        self.vendor_cb = ttk.Combobox(vendor_row, textvariable=self.vendor_var, state="readonly", width=20)
-        self.vendor_cb.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        self.vendor_cb = ttk.Combobox(left, textvariable=self.vendor_var, state="readonly", width=26)
+        self.vendor_cb.pack(fill=tk.X)
         self.vendor_cb.bind("<<ComboboxSelected>>", self.on_vendor_change)
-
-        ttk.Button(vendor_row, text="+", width=3, command=self.add_vendor).pack(side=tk.LEFT, padx=3)
-        ttk.Button(vendor_row, text="-", width=3, command=self.delete_vendor).pack(side=tk.LEFT, padx=3)
-        ttk.Button(vendor_row, text="R", width=3, command=self.rename_vendor).pack(side=tk.LEFT, padx=3)
 
         ttk.Label(left, text="Keyword Delimiter (Vendor)").pack(anchor="w", pady=(10, 0))
         delim_row = ttk.Frame(left)
@@ -640,18 +641,8 @@ class KeywordGuideApp(tk.Tk):
         right = ttk.Frame(root)
         right.grid(row=0, column=1, sticky="nsew", padx=(12, 0))
 
-        # Filter row
-        filter_row = ttk.Frame(right)
-        filter_row.grid(row=0, column=0, sticky="ew")
-        ttk.Label(filter_row, text="Filter").pack(side=tk.LEFT)
-        ent_filter = ttk.Entry(filter_row, textvariable=self.filter_var)
-        ent_filter.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(6, 6))
-        ttk.Button(filter_row, text="Clear", command=self._clear_filter).pack(side=tk.LEFT)
-
-        self.filter_var.trace_add("write", lambda *_: self.refresh_keywords())
-
         ttk.Label(right, text="Keywords: Summary / Keyword(Joined) / Preview(Rendered) / Info / Copy").grid(
-            row=1, column=0, sticky="w", pady=(8, 0)
+            row=0, column=0, sticky="w"
         )
 
         self.tree = ttk.Treeview(right, columns=KEYWORD_COLS, show="headings", height=13)
@@ -664,10 +655,10 @@ class KeywordGuideApp(tk.Tk):
         self.tree.column("info", width=DEFAULT_KEYWORD_COL_WIDTHS["info"], anchor="center", stretch=False)
         self.tree.column("copy", width=DEFAULT_KEYWORD_COL_WIDTHS["copy"], anchor="center", stretch=False)
 
-        self.tree.grid(row=2, column=0, sticky="nsew", pady=(4, 0))
+        self.tree.grid(row=1, column=0, sticky="nsew", pady=(4, 0))
         sb = ttk.Scrollbar(right, orient="vertical", command=self.tree.yview)
         self.tree.configure(yscrollcommand=sb.set)
-        sb.grid(row=2, column=1, sticky="ns", pady=(4, 0))
+        sb.grid(row=1, column=1, sticky="ns", pady=(4, 0))
 
         try:
             self.tree.tag_configure("copied", font=self._font_bold)
@@ -678,23 +669,18 @@ class KeywordGuideApp(tk.Tk):
         self.tree.bind("<Double-1>", self.on_tree_double_click)
         self.tree.bind("<<TreeviewSelect>>", self.on_keyword_select)
 
-        # Drag&drop reorder bindings
-        self.tree.bind("<ButtonPress-1>", self._on_kw_drag_start, add="+")
-        self.tree.bind("<B1-Motion>", self._on_kw_drag_motion, add="+")
-        self.tree.bind("<ButtonRelease-1>", self._on_kw_drag_drop, add="+")
-
         btns = ttk.Frame(right)
-        btns.grid(row=3, column=0, sticky="e", pady=8)
+        btns.grid(row=2, column=0, sticky="e", pady=8)
         ttk.Button(btns, text="Add", command=self.add_keyword).pack(side=tk.LEFT, padx=4)
         ttk.Button(btns, text="Edit", command=self.edit_keyword).pack(side=tk.LEFT, padx=4)
         ttk.Button(btns, text="Remove", command=self.remove_keyword).pack(side=tk.LEFT, padx=4)
         ttk.Button(btns, text="Reset UI Layout", command=self.reset_ui_layout).pack(side=tk.LEFT, padx=12)
 
         self.inline_box = ttk.LabelFrame(right, text="Inline Parameters (selected keyword placeholders)")
-        self.inline_box.grid(row=4, column=0, sticky="ew", pady=(6, 0))
+        self.inline_box.grid(row=3, column=0, sticky="ew", pady=(6, 0))
 
         param_box = ttk.LabelFrame(right, text="Parameters (Category-level)")
-        param_box.grid(row=5, column=0, sticky="nsew", pady=(10, 0))
+        param_box.grid(row=4, column=0, sticky="nsew", pady=(10, 0))
 
         self.param_tree = ttk.Treeview(param_box, columns=PARAM_COLS, show="headings", height=7)
         self.param_tree.heading("pname", text="Name")
@@ -722,24 +708,9 @@ class KeywordGuideApp(tk.Tk):
         root.columnconfigure(1, weight=1)
         root.rowconfigure(0, weight=1)
         right.columnconfigure(0, weight=1)
-        right.rowconfigure(2, weight=1)
+        right.rowconfigure(1, weight=1)
         param_box.columnconfigure(0, weight=1)
         param_box.rowconfigure(0, weight=1)
-
-    # --------------------------------------------------------
-    # Filter helpers
-    # --------------------------------------------------------
-    def _clear_filter(self):
-        self.filter_var.set("")
-
-    def _match_filter(self, kw: dict, joined: str) -> bool:
-        q = (self.filter_var.get() or "").strip().lower()
-        if not q:
-            return True
-        summary = str(kw.get("summary", "")).lower()
-        desc = str(kw.get("desc", "")).lower()
-        joined_l = str(joined or "").lower()
-        return (q in summary) or (q in desc) or (q in joined_l)
 
     # --------------------------------------------------------
     # Navigation
@@ -806,94 +777,6 @@ class KeywordGuideApp(tk.Tk):
         self.on_keyword_select()
 
     # --------------------------------------------------------
-    # Vendor CRUD
-    # --------------------------------------------------------
-    def add_vendor(self):
-        name = simpledialog.askstring("Add Vendor", "Vendor name (e.g., MTK, SLSI):")
-        if not name:
-            return
-        name = name.strip()
-        if not name:
-            return
-        if name in self.db:
-            messagebox.showwarning("Warning", "Vendor already exists.")
-            return
-
-        # init DB + issue cfg
-        self.db[name] = {}
-        self.issue_cfg.setdefault("vendors", {})
-        self.issue_cfg["vendors"][name] = {"issues": default_issues(), "delimiter": DEFAULT_DELIMITER}
-        for issue in default_issues():
-            self.db[name][issue] = self._default_issue_obj()
-
-        self._persist_db("Vendor added (DB)")
-        self._persist_issues("Vendor added (issues_config)")
-
-        self.vendor_cb["values"] = list(self.db.keys())
-        self.vendor_var.set(name)
-        self.on_vendor_change()
-
-    def delete_vendor(self):
-        v = self.vendor_var.get()
-        if not v:
-            return
-
-        vendors = list(self.db.keys())
-        if len(vendors) <= 1:
-            messagebox.showinfo("Info", "At least one vendor must remain.")
-            return
-
-        if not messagebox.askyesno("Confirm", f"Delete vendor '{v}'?"):
-            return
-
-        # remove DB + cfg
-        if v in self.db:
-            del self.db[v]
-        if isinstance(self.issue_cfg.get("vendors", {}), dict) and v in self.issue_cfg["vendors"]:
-            del self.issue_cfg["vendors"][v]
-
-        self._persist_db("Vendor deleted (DB)")
-        self._persist_issues("Vendor deleted (issues_config)")
-
-        vendors = list(self.db.keys())
-        self.vendor_cb["values"] = vendors
-        self.vendor_var.set(vendors[0])
-        self.on_vendor_change()
-
-    def rename_vendor(self):
-        v = self.vendor_var.get()
-        if not v:
-            return
-
-        new = simpledialog.askstring("Rename Vendor", "New vendor name:", initialvalue=v)
-        if not new:
-            return
-        new = new.strip()
-        if not new or new == v:
-            return
-        if new in self.db:
-            messagebox.showwarning("Warning", "Vendor already exists.")
-            return
-
-        # move DB
-        self.db[new] = self.db.pop(v)
-
-        # move cfg
-        self.issue_cfg.setdefault("vendors", {})
-        if v in self.issue_cfg["vendors"]:
-            self.issue_cfg["vendors"][new] = self.issue_cfg["vendors"].pop(v)
-        else:
-            self.issue_cfg["vendors"][new] = {"issues": default_issues(), "delimiter": DEFAULT_DELIMITER}
-
-        self._persist_db("Vendor renamed (DB)")
-        self._persist_issues("Vendor renamed (issues_config)")
-
-        vendors = list(self.db.keys())
-        self.vendor_cb["values"] = vendors
-        self.vendor_var.set(new)
-        self.on_vendor_change()
-
-    # --------------------------------------------------------
     # Data helpers
     # --------------------------------------------------------
     def _current_obj(self):
@@ -920,13 +803,6 @@ class KeywordGuideApp(tk.Tk):
         _ = self._current_obj()
         self._persist_db("DB migrated/normalized")
 
-    def _find_kw_index_by_iid(self, iid: str):
-        obj = self._current_obj()
-        for idx, kw in enumerate(obj["_keywords"]):
-            if str(kw.get("_id", "")) == str(iid):
-                return idx
-        return None
-
     # --------------------------------------------------------
     # Refresh
     # --------------------------------------------------------
@@ -944,22 +820,14 @@ class KeywordGuideApp(tk.Tk):
         v = self.vendor_var.get()
         delim = self._get_vendor_delimiter(v)
 
-        for kw in obj["_keywords"]:
-            kw = _ensure_kw_id(kw)
+        for idx, kw in enumerate(obj["_keywords"]):
             raw_joined = keyword_joined_template(kw, delim)
-            if not self._match_filter(kw, raw_joined):
-                continue
             summary = kw.get("summary", "")
             preview = render_keyword(raw_joined, params)
-            iid = str(kw.get("_id"))
-            self.tree.insert("", "end", iid=iid, values=(summary, raw_joined, preview, "Info", "Copy"))
+            self.tree.insert("", "end", iid=str(idx), values=(summary, raw_joined, preview, "Info", "Copy"))
 
         v, i, d = self.vendor_var.get(), self.issue_var.get(), self.detail_var.get()
-        q = (self.filter_var.get() or "").strip()
-        if q:
-            self.status_var.set(f"Selected: {v} > {i} > {d}   |   Filter: '{q}'")
-        else:
-            self.status_var.set(f"Selected: {v} > {i} > {d}")
+        self.status_var.set(f"Selected: {v} > {i} > {d}")
 
     def refresh_params(self):
         self.param_tree.delete(*self.param_tree.get_children())
@@ -986,12 +854,7 @@ class KeywordGuideApp(tk.Tk):
             self.clear_inline()
             return
 
-        iid = sel[0]
-        idx = self._find_kw_index_by_iid(iid)
-        if idx is None:
-            self.clear_inline()
-            return
-
+        idx = int(sel[0])
         obj = self._current_obj()
         kw = obj["_keywords"][idx]
 
@@ -1036,11 +899,14 @@ class KeywordGuideApp(tk.Tk):
     # --------------------------------------------------------
     # Keyword CRUD
     # --------------------------------------------------------
-    def _selected_keyword_iid(self):
+    def _selected_keyword_index(self):
         sel = self.tree.selection()
         if not sel:
             return None
-        return sel[0]
+        try:
+            return int(sel[0])
+        except Exception:
+            return None
 
     def add_keyword(self):
         v = self.vendor_var.get()
@@ -1048,20 +914,15 @@ class KeywordGuideApp(tk.Tk):
         dlg = KeywordDialog(self, "Add Keyword", init={"parts": [""], "summary": "", "desc": ""}, delimiter=delim)
         if dlg.result:
             obj = self._current_obj()
-            kw = dlg.result
-            kw["_id"] = str(uuid.uuid4())
-            obj["_keywords"].append(kw)
+            obj["_keywords"].append(dlg.result)
             self._persist_db("Keyword added")
             self.refresh_keywords()
 
     def edit_keyword(self):
-        iid = self._selected_keyword_iid()
-        if not iid:
-            return
-        obj = self._current_obj()
-        idx = self._find_kw_index_by_iid(iid)
+        idx = self._selected_keyword_index()
         if idx is None:
             return
+        obj = self._current_obj()
         kw = obj["_keywords"][idx]
 
         v = self.vendor_var.get()
@@ -1069,24 +930,15 @@ class KeywordGuideApp(tk.Tk):
 
         dlg = KeywordDialog(self, "Edit Keyword", init=kw, delimiter=delim)
         if dlg.result:
-            new_kw = dlg.result
-            new_kw["_id"] = kw.get("_id")  # keep stable id
-            obj["_keywords"][idx] = new_kw
+            obj["_keywords"][idx] = dlg.result
             self._persist_db("Keyword edited")
             self.refresh_keywords()
-            try:
-                self.tree.selection_set(str(new_kw["_id"]))
-            except Exception:
-                pass
 
     def remove_keyword(self):
-        iid = self._selected_keyword_iid()
-        if not iid:
-            return
-        obj = self._current_obj()
-        idx = self._find_kw_index_by_iid(iid)
+        idx = self._selected_keyword_index()
         if idx is None:
             return
+        obj = self._current_obj()
         del obj["_keywords"][idx]
         self._persist_db("Keyword removed")
         self.refresh_keywords()
@@ -1097,14 +949,11 @@ class KeywordGuideApp(tk.Tk):
     # --------------------------------------------------------
     def on_tree_click(self, event):
         col = self.tree.identify_column(event.x)
-        row_iid = self.tree.identify_row(event.y)
-        if not row_iid:
+        row = self.tree.identify_row(event.y)
+        if not row:
             return
 
-        idx = self._find_kw_index_by_iid(row_iid)
-        if idx is None:
-            return
-
+        idx = int(row)
         obj = self._current_obj()
         params = obj["_params"]
         kw = obj["_keywords"][idx]
@@ -1125,7 +974,7 @@ class KeywordGuideApp(tk.Tk):
             rendered = render_keyword(raw_joined, params)
             self.clipboard_clear()
             self.clipboard_append(rendered)
-            self._show_copy_feedback(row_iid)
+            self._show_copy_feedback(row)
             self.status_var.set(f"Copied: {rendered}")
 
     def on_tree_double_click(self, event):
@@ -1133,70 +982,6 @@ class KeywordGuideApp(tk.Tk):
         if col in ("#4", "#5"):
             return
         self.edit_keyword()
-
-    # --------------------------------------------------------
-    # Drag & Drop reorder (only when filter empty)
-    # --------------------------------------------------------
-    def _on_kw_drag_start(self, event):
-        # do not start drag when clicking Info/Copy columns
-        col = self.tree.identify_column(event.x)
-        if col in ("#4", "#5"):
-            return
-
-        q = (self.filter_var.get() or "").strip()
-        if q:
-            # reorder disabled under filter
-            return
-
-        row_iid = self.tree.identify_row(event.y)
-        if not row_iid:
-            return
-
-        self._drag_kw_active = True
-        self._drag_kw_src_iid = row_iid
-
-    def _on_kw_drag_motion(self, event):
-        if not self._drag_kw_active:
-            return
-        row_iid = self.tree.identify_row(event.y)
-        if not row_iid:
-            return
-        # highlight current hover row
-        try:
-            self.tree.selection_set(row_iid)
-        except Exception:
-            pass
-
-    def _on_kw_drag_drop(self, event):
-        if not self._drag_kw_active:
-            return
-        self._drag_kw_active = False
-
-        src = self._drag_kw_src_iid
-        self._drag_kw_src_iid = None
-        if not src:
-            return
-
-        dst = self.tree.identify_row(event.y)
-        if not dst or dst == src:
-            return
-
-        obj = self._current_obj()
-        src_idx = self._find_kw_index_by_iid(src)
-        dst_idx = self._find_kw_index_by_iid(dst)
-        if src_idx is None or dst_idx is None:
-            return
-
-        kw_list = obj["_keywords"]
-        item = kw_list.pop(src_idx)
-        kw_list.insert(dst_idx, item)
-
-        self._persist_db("Keyword reordered")
-        self.refresh_keywords()
-        try:
-            self.tree.selection_set(src)
-        except Exception:
-            pass
 
     # --------------------------------------------------------
     # Copy feedback UI
