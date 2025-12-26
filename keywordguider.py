@@ -1,17 +1,18 @@
 # ============================================================
 # Keyword Guide UI POC
 # ------------------------------------------------------------
-# Version: 0.3.7 (2025-12-26)
+# Version: 0.3.8 (2025-12-26)
 #
-# Release Notes (v0.3.7)
-# 1) Keyword List: 다중 선택(extended) 지원
-# 2) 선택된 여러 Keyword를 Vendor delimiter로 연결하여 한 번에 Copy
-#    - 버튼: "Copy Selected"
-#    - 단축키: Ctrl+C
+# Release Notes (v0.3.8)
+# 1) Keyword List: Up/Down 버튼 추가 (단일 선택 기준으로만 순서 변경)
+#    - obj["_keywords"] 리스트에서 swap 후 즉시 저장 + refresh
+#    - 이동 후 해당 항목 selection 유지(see 포함)
 #
-# Existing (v0.3.6 유지)
+# Existing (v0.3.7 유지)
 # - Keyword List View 컬럼: Summary | Info | Copy | Preview
-# - KeywordDialog: Parts 영역 고정 높이 + 스크롤
+# - Keyword List: multi-select(extended) 지원
+# - Copy Selected: 선택된 keyword들을 vendor delimiter로 join하여 한 번에 copy (버튼 + Ctrl+C)
+# - KeywordDialog: Parts 영역 고정 높이 + 스크롤 (행 많아도 창 height 폭증 방지)
 # - Preview: wrap + 고정 lines + 스크롤
 # - Import Joined String split: 확인 후 적용
 # - Part 입력 중 delimiter 포함 시: 확인 후 split 제안(자동 아님)
@@ -217,7 +218,6 @@ class KeywordDialog(tk.Toplevel):
 
     Parts 영역:
       - 고정 height + vertical scroll (Canvas)
-      - Part row 많아도 Dialog height 폭증 방지
 
     Preview:
       - wrap + 고정 lines + vertical scroll
@@ -841,7 +841,7 @@ class KeywordGuideApp(tk.Tk):
 
         ttk.Label(right, text="Keywords: Summary / Info / Copy / Preview(Rendered)").grid(row=0, column=0, sticky="w")
 
-        # IMPORTANT: multi-select enabled here
+        # multi-select enabled here (Copy Selected용). Up/Down은 단일 선택(첫번째 선택)만 사용.
         self.tree = ttk.Treeview(right, columns=KEYWORD_COLS, show="headings", height=13, selectmode="extended")
 
         headings = {
@@ -882,6 +882,9 @@ class KeywordGuideApp(tk.Tk):
         ttk.Button(btns, text="Add", command=self.add_keyword).pack(side=tk.LEFT, padx=4)
         ttk.Button(btns, text="Edit", command=self.edit_keyword).pack(side=tk.LEFT, padx=4)
         ttk.Button(btns, text="Remove", command=self.remove_keyword).pack(side=tk.LEFT, padx=4)
+
+        ttk.Button(btns, text="Up", command=self.move_keyword_up).pack(side=tk.LEFT, padx=4)
+        ttk.Button(btns, text="Down", command=self.move_keyword_down).pack(side=tk.LEFT, padx=4)
 
         ttk.Separator(btns, orient="vertical").pack(side=tk.LEFT, fill=tk.Y, padx=10)
 
@@ -1066,7 +1069,7 @@ class KeywordGuideApp(tk.Tk):
             self.clear_inline()
             return
 
-        # multi-select 중, inline은 "첫번째 선택" 기준으로 표시
+        # multi-select 중 inline은 첫 선택 기준
         try:
             idx = int(sel[0])
         except Exception:
@@ -1115,7 +1118,7 @@ class KeywordGuideApp(tk.Tk):
         self.refresh_params()
 
     # --------------------------------------------------------
-    # NEW: Bulk copy selected keywords
+    # Bulk copy selected keywords (Rendered, vendor delimiter join)
     # --------------------------------------------------------
     def copy_selected_keywords(self, _event=None):
         sel = list(self.tree.selection())
@@ -1123,7 +1126,6 @@ class KeywordGuideApp(tk.Tk):
             self.status_var.set("No selection to copy.")
             return
 
-        # keep visual order (iid is index-string)
         try:
             sel_sorted = sorted(sel, key=lambda x: int(x))
         except Exception:
@@ -1204,6 +1206,63 @@ class KeywordGuideApp(tk.Tk):
         self._persist_db("Keyword removed")
         self.refresh_keywords()
         self.clear_inline()
+
+    # --------------------------------------------------------
+    # Up / Down (single selection only)
+    # --------------------------------------------------------
+    def move_keyword_up(self):
+        sel = list(self.tree.selection())
+        if not sel:
+            return
+        try:
+            idx = int(sel[0])
+        except Exception:
+            return
+
+        obj = self._current_obj()
+        kws = obj.get("_keywords", [])
+        if not isinstance(kws, list) or idx <= 0 or idx >= len(kws):
+            return
+
+        kws[idx - 1], kws[idx] = kws[idx], kws[idx - 1]
+        obj["_keywords"] = kws
+
+        self._persist_db("Keyword moved up")
+        self.refresh_keywords()
+
+        new_iid = str(idx - 1)
+        try:
+            self.tree.selection_set(new_iid)
+            self.tree.see(new_iid)
+        except Exception:
+            pass
+
+    def move_keyword_down(self):
+        sel = list(self.tree.selection())
+        if not sel:
+            return
+        try:
+            idx = int(sel[0])
+        except Exception:
+            return
+
+        obj = self._current_obj()
+        kws = obj.get("_keywords", [])
+        if not isinstance(kws, list) or idx < 0 or idx >= len(kws) - 1:
+            return
+
+        kws[idx + 1], kws[idx] = kws[idx], kws[idx + 1]
+        obj["_keywords"] = kws
+
+        self._persist_db("Keyword moved down")
+        self.refresh_keywords()
+
+        new_iid = str(idx + 1)
+        try:
+            self.tree.selection_set(new_iid)
+            self.tree.see(new_iid)
+        except Exception:
+            pass
 
     # --------------------------------------------------------
     # Keyword Tree click handlers
