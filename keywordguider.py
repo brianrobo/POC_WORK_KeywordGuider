@@ -1,12 +1,17 @@
 # ============================================================
 # Keyword Guide UI POC
 # ------------------------------------------------------------
-# Version: 0.3.2 (2025-12-26)
+# Version: 0.3.3 (2025-12-26)
 #
-# Release Notes (v0.3.2)
-# 1) KeywordDialog Preview UX 개선
+# Release Notes (v0.3.3)
+# 1) KeywordDialog Preview UX 개선 (유지)
 #    - Preview는 전체 문자열을 유지하되, 창 가로 폭 초과 시 자동 줄바꿈(wrap)
-#    - Preview 영역은 고정된 표시 줄 수(최대 N줄)로만 보여주고, 길면 스크롤로 확인
+#    - Preview 영역은 고정된 표시 줄 수(최대 N줄) + 세로 스크롤로 전체 확인
+#
+# 2) Joined String → Parts 자동 분해 UX 추가 (확인 후 적용)
+#    - "Import Joined String" 입력란 추가 + Split 버튼/Enter로 분해
+#    - Parts 입력 중(특히 1st part)에 delimiter 포함된 긴 문자열이 들어오면
+#      "Parts로 분해할까요?" 확인 팝업 후 적용(자동 적용 아님)
 #
 # Existing Features (유지)
 # - Vendor별 Issue 관리 + Vendor별 Delimiter 저장
@@ -49,7 +54,7 @@ COPY_FEEDBACK_MS = 900
 DEFAULT_DELIMITER = ";"
 
 # KeywordDialog Preview UI
-PREVIEW_MAX_LINES = 4  # 고정 표시 줄 수(원하시면 3~6 정도로 조정)
+PREVIEW_MAX_LINES = 4  # Preview 고정 표시 줄 수(원하시면 3~6 정도로 조정)
 
 
 # ------------------------------------------------------------
@@ -226,6 +231,11 @@ class KeywordDialog(tk.Toplevel):
       - Wrap to next line when dialog width is exceeded
       - Show only up to PREVIEW_MAX_LINES lines in view (fixed height),
         with vertical scrollbar to inspect long preview.
+
+    Joined String -> Parts UX:
+      - "Import Joined String" entry + Split button/Enter (confirm then apply)
+      - If user pastes/types joined string with delimiter into Part entry,
+        offer confirm popup then apply (not automatic).
     """
     def __init__(self, parent, title, init=None, delimiter=";"):
         super().__init__(parent)
@@ -239,18 +249,47 @@ class KeywordDialog(tk.Toplevel):
         self.var_summary = tk.StringVar(value=str(init.get("summary", "")))
         self.var_join_preview = tk.StringVar(value="")
 
+        # split-offer throttle
+        self._last_split_offer_text = None
+        self._split_offer_inflight = False
+
         frm = ttk.Frame(self, padding=12)
         frm.pack(fill=tk.BOTH, expand=True)
+
+        # Row mapping:
+        # 0/1 Summary
+        # 2/3 Import Joined
+        # 4/5 Parts
+        # 6/7 Preview
+        # 8/9 Description
+        # 10 Buttons
 
         ttk.Label(frm, text="Summary (ListView에 표시될 짧은 요약)").grid(row=0, column=0, sticky="w")
         ent_sum = ttk.Entry(frm, textvariable=self.var_summary)
         ent_sum.grid(row=1, column=0, sticky="ew", pady=(2, 10))
 
-        ttk.Label(frm, text=f"Keyword Parts (구분자: '{self.delimiter}')").grid(row=2, column=0, sticky="w")
+        # --- Import joined string -> split into parts
+        ttk.Label(frm, text=f"Import Joined String (delimiter: '{self.delimiter}')").grid(
+            row=2, column=0, sticky="w"
+        )
+
+        import_row = ttk.Frame(frm)
+        import_row.grid(row=3, column=0, sticky="ew", pady=(2, 10))
+        import_row.columnconfigure(0, weight=1)
+
+        self.var_import_joined = tk.StringVar(value="")
+        self.ent_import = ttk.Entry(import_row, textvariable=self.var_import_joined)
+        self.ent_import.grid(row=0, column=0, sticky="ew")
+        ttk.Button(import_row, text="Split", command=lambda: self._import_joined_to_parts(ask_confirm=True)).grid(
+            row=0, column=1, padx=(6, 0)
+        )
+        self.ent_import.bind("<Return>", lambda _e: self._import_joined_to_parts(ask_confirm=True))
 
         # Parts area
+        ttk.Label(frm, text=f"Keyword Parts (구분자: '{self.delimiter}')").grid(row=4, column=0, sticky="w")
+
         parts_box = ttk.Frame(frm)
-        parts_box.grid(row=3, column=0, sticky="ew", pady=(2, 6))
+        parts_box.grid(row=5, column=0, sticky="ew", pady=(2, 6))
         parts_box.columnconfigure(0, weight=1)
 
         self.parts_container = ttk.Frame(parts_box)
@@ -262,10 +301,10 @@ class KeywordDialog(tk.Toplevel):
         ttk.Button(add_btn_row, text="+ Add Part", command=self._add_part_row).pack(side=tk.LEFT)
 
         # Preview
-        ttk.Label(frm, text="Joined Keyword Preview (auto wrap, scrollable)").grid(row=4, column=0, sticky="w", pady=(6, 0))
+        ttk.Label(frm, text="Joined Keyword Preview (auto wrap, scrollable)").grid(row=6, column=0, sticky="w", pady=(6, 0))
 
         preview_box = ttk.Frame(frm)
-        preview_box.grid(row=5, column=0, sticky="ew", pady=(2, 10))
+        preview_box.grid(row=7, column=0, sticky="ew", pady=(2, 10))
         preview_box.columnconfigure(0, weight=1)
 
         self.preview_text = tk.Text(
@@ -282,18 +321,19 @@ class KeywordDialog(tk.Toplevel):
         self.preview_scroll.grid(row=0, column=1, sticky="ns", padx=(6, 0))
         self.preview_text.configure(yscrollcommand=self.preview_scroll.set)
 
-        ttk.Label(frm, text="Description (긴 설명, Info 팝업으로 표시)").grid(row=6, column=0, sticky="w")
+        # Description
+        ttk.Label(frm, text="Description (긴 설명, Info 팝업으로 표시)").grid(row=8, column=0, sticky="w")
         self.txt_desc = tk.Text(frm, height=10, wrap="word")
-        self.txt_desc.grid(row=7, column=0, sticky="nsew", pady=(2, 10))
+        self.txt_desc.grid(row=9, column=0, sticky="nsew", pady=(2, 10))
         self.txt_desc.insert("1.0", str(init.get("desc", "")))
 
         btns = ttk.Frame(frm)
-        btns.grid(row=8, column=0, sticky="e")
+        btns.grid(row=10, column=0, sticky="e")
         ttk.Button(btns, text="Cancel", command=self._cancel).pack(side=tk.LEFT, padx=6)
         ttk.Button(btns, text="OK", command=self._ok).pack(side=tk.LEFT)
 
         frm.columnconfigure(0, weight=1)
-        frm.rowconfigure(7, weight=1)
+        frm.rowconfigure(9, weight=1)
 
         # Build initial part rows
         initial_parts = keyword_parts_from_kw(init, self.delimiter)
@@ -303,6 +343,12 @@ class KeywordDialog(tk.Toplevel):
         for p in initial_parts:
             self._add_part_row(initial_text=p)
 
+        # populate import field with current joined (optional convenience)
+        try:
+            self.var_import_joined.set(self.delimiter.join([x for x in initial_parts if str(x).strip()]))
+        except Exception:
+            pass
+
         self._update_preview()
 
         self.transient(parent)
@@ -311,6 +357,7 @@ class KeywordDialog(tk.Toplevel):
         ent_sum.focus_set()
         self.wait_window(self)
 
+    # ---------- Part rows ----------
     def _add_part_row(self, initial_text=""):
         row = ttk.Frame(self.parts_container)
         row.pack(fill=tk.X, pady=2)
@@ -324,7 +371,12 @@ class KeywordDialog(tk.Toplevel):
         btn = ttk.Button(row, text="-", width=3, command=lambda r=row: self._remove_part_row(r))
         btn.pack(side=tk.LEFT, padx=(6, 0))
 
-        ent.bind("<KeyRelease>", lambda _e: self._update_preview())
+        # update preview
+        ent.bind("<KeyRelease>", lambda e, w=ent: self._on_part_entry_keyrelease(e, w))
+        # paste (offer split after paste completes)
+        ent.bind("<Control-v>", lambda e, w=ent: self._after_paste_offer_split(w))
+        ent.bind("<Control-V>", lambda e, w=ent: self._after_paste_offer_split(w))
+
         self._update_preview()
 
     def _remove_part_row(self, row_frame):
@@ -361,13 +413,27 @@ class KeywordDialog(tk.Toplevel):
                     parts.append(s)
         return parts
 
+    def _clear_all_part_rows(self):
+        for child in list(self.parts_container.winfo_children()):
+            try:
+                child.destroy()
+            except Exception:
+                pass
+
+    def _set_parts_rows(self, parts: list[str]):
+        self._clear_all_part_rows()
+        if not parts:
+            parts = [""]  # 최소 1개 row 유지
+        for p in parts:
+            self._add_part_row(initial_text=p)
+        self._update_preview()
+
+    # ---------- Preview ----------
     def _set_preview_text(self, text: str):
         self.preview_text.configure(state="normal")
         self.preview_text.delete("1.0", "end")
         self.preview_text.insert("1.0", text or "")
         self.preview_text.configure(state="disabled")
-
-        # 항상 맨 위부터 보이게(원하면 end로 변경 가능)
         try:
             self.preview_text.yview_moveto(0.0)
         except Exception:
@@ -376,9 +442,109 @@ class KeywordDialog(tk.Toplevel):
     def _update_preview(self):
         parts = self._get_parts()
         joined = self.delimiter.join(parts)
-        self.var_join_preview.set(joined)   # 내부 상태는 유지
-        self._set_preview_text(joined)      # UI는 wrap+scroll
+        self.var_join_preview.set(joined)
+        self._set_preview_text(joined)
+        # import field은 사용자가 편하게 가져다 쓸 수 있게 동기화(단, 사용자가 직접 편집 중이면 방해될 수 있어 최소화)
+        # 여기서는 강제 동기화하지 않음.
 
+    # ---------- Split / Import UX ----------
+    def _split_by_delimiter(self, text: str) -> list[str]:
+        delim = self.delimiter if self.delimiter is not None else DEFAULT_DELIMITER
+        delim = str(delim)
+        if delim == "":
+            return []
+        parts = [p.strip() for p in (text or "").split(delim)]
+        parts = [p for p in parts if p]
+        return parts
+
+    def _confirm_apply_split(self, parts: list[str], source_label: str) -> bool:
+        if not parts:
+            return False
+        sample = self.delimiter.join(parts[:6])
+        msg = (
+            f"{source_label} 입력에서 구분자('{self.delimiter}') 기준으로 {len(parts)}개 Part가 감지되었습니다.\n\n"
+            f"Parts로 분해하여 적용할까요?\n\n"
+            f"예시(앞부분): {sample}"
+        )
+        return messagebox.askyesno("Split into Parts?", msg)
+
+    def _import_joined_to_parts(self, ask_confirm: bool = True):
+        raw = (self.var_import_joined.get() or "").strip()
+        if not raw:
+            return
+
+        parts = self._split_by_delimiter(raw)
+        if not parts:
+            messagebox.showinfo("Info", "분해할 수 있는 Part가 없습니다. (Delimiter가 비어있거나 split 결과가 비어있음)")
+            return
+
+        if ask_confirm and not self._confirm_apply_split(parts, source_label="Import Joined String"):
+            return
+
+        self._set_parts_rows(parts)
+        self._last_split_offer_text = raw
+
+    def _after_paste_offer_split(self, entry_widget):
+        # paste는 이벤트 후 실제 텍스트가 들어오므로 after로 확인
+        self.after(1, lambda: self._offer_split_from_part_entry(entry_widget))
+
+    def _on_part_entry_keyrelease(self, event, entry_widget):
+        self._update_preview()
+        # 키 입력으로 delimiter가 들어오는 경우도 있으므로, 조건 맞으면 확인 팝업 제공
+        self._offer_split_from_part_entry(entry_widget)
+
+    def _offer_split_from_part_entry(self, entry_widget):
+        # 중복 팝업/연쇄 팝업 방지
+        if self._split_offer_inflight:
+            return
+
+        try:
+            raw = (entry_widget.get() or "").strip()
+        except Exception:
+            return
+
+        if not raw:
+            return
+
+        delim = str(self.delimiter if self.delimiter is not None else DEFAULT_DELIMITER)
+        if delim == "" or delim not in raw:
+            return
+
+        parts = self._split_by_delimiter(raw)
+        if len(parts) <= 1:
+            return
+
+        # 같은 텍스트로 반복 제안 방지
+        if raw == self._last_split_offer_text:
+            return
+
+        # “정말 joined string일 가능성”이 높을 때만 제안:
+        # - 현재 non-empty parts가 1개뿐이거나, 첫 번째 row에 입력된 경우 (대부분 joined paste)
+        current_parts = self._get_parts()
+        likely_joined = (len(current_parts) <= 1)
+        if not likely_joined:
+            # 그래도 사용자 편의를 위해 제안은 가능하지만, 너무 공격적이면 불편할 수 있어 제한
+            # 여기서는 "현재 입력칸 문자열이 매우 길 때"만 제안
+            if len(raw) < 30:
+                return
+
+        self._split_offer_inflight = True
+        try:
+            ok = self._confirm_apply_split(parts, source_label="Part 입력")
+            if ok:
+                self._set_parts_rows(parts)
+                # Import 칸에도 넣어두면 다음 수정에 도움
+                try:
+                    self.var_import_joined.set(self.delimiter.join(parts))
+                except Exception:
+                    pass
+                self._last_split_offer_text = raw
+            else:
+                self._last_split_offer_text = raw  # 거절해도 동일 텍스트 반복 팝업 방지
+        finally:
+            self._split_offer_inflight = False
+
+    # ---------- OK/Cancel ----------
     def _ok(self):
         parts = self._get_parts()
         if not parts:
