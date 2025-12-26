@@ -1,15 +1,16 @@
 # ============================================================
 # Keyword Guide UI POC
 # ------------------------------------------------------------
-# Version: 0.3.4 (2025-12-26)
+# Version: 0.3.5 (2025-12-26)
 #
-# Release Notes (v0.3.4)
-# 1) KeywordDialog: Parts 영역이 Part 개수에 따라 무한히 커져서 창 하단이 짤리던 문제 해결
-#    - Parts 영역을 "고정 높이 + 세로 스크롤" 구조로 변경 (Canvas + Scrollbar)
-#    - Part row가 많아도 Dialog height는 과도하게 커지지 않음
-#    - 마우스휠로 Parts 영역 스크롤 지원 (Windows/Mac/Linux 기본 케이스 대응)
+# Release Notes (v0.3.5)
+# 1) Keyword list(Treeview) 컬럼 순서 변경
+#    - 기존: Summary | Keyword | Preview | Info | Copy
+#    - 변경: Summary | Info | Copy | Keyword | Preview
+#    - 목적: Info/Copy가 화면 오른쪽에서 잘리는 UX 개선
 #
-# 2) 기존 v0.3.3 기능 유지
+# 2) v0.3.4 기능 유지
+#    - KeywordDialog: Parts 영역 고정 높이 + 스크롤 (창 height 폭증 방지)
 #    - Preview: wrap + 고정 lines + 스크롤
 #    - Import Joined String split: 확인 후 적용
 #    - Part 입력 중 delimiter 포함 시: 확인 후 split 제안(자동 아님)
@@ -39,13 +40,15 @@ ISSUES_PATH = BASE_DIR / "issues_config.json"
 PLACEHOLDER_RE = re.compile(r"\{([A-Za-z0-9_]+)\}")
 DEFAULT_GEOMETRY = "1250x760"
 
-KEYWORD_COLS = ("summary", "keyword", "preview", "info", "copy")
+# 컬럼 순서 변경: Summary | Info | Copy | Keyword | Preview
+KEYWORD_COLS = ("summary", "info", "copy", "keyword", "preview")
+
 DEFAULT_KEYWORD_COL_WIDTHS = {
     "summary": 220,
-    "keyword": 420,
-    "preview": 360,
     "info": 70,
     "copy": 70,
+    "keyword": 420,
+    "preview": 360,
 }
 
 PARAM_COLS = ("pname", "pval")
@@ -58,7 +61,7 @@ DEFAULT_DELIMITER = ";"
 PREVIEW_MAX_LINES = 4
 
 # KeywordDialog Parts area (scrollable fixed height)
-PARTS_AREA_HEIGHT_PX = 160  # Part rows가 많아도 이 높이 안에서 스크롤로 확인
+PARTS_AREA_HEIGHT_PX = 160
 
 
 # ------------------------------------------------------------
@@ -248,19 +251,10 @@ class KeywordDialog(tk.Toplevel):
         frm = ttk.Frame(self, padding=12)
         frm.pack(fill=tk.BOTH, expand=True)
 
-        # Layout rows:
-        # 0/1 Summary
-        # 2/3 Import Joined
-        # 4/5 Parts (scroll)
-        # 6/7 Preview
-        # 8/9 Description
-        # 10 Buttons
-
         ttk.Label(frm, text="Summary (ListView에 표시될 짧은 요약)").grid(row=0, column=0, sticky="w")
         ent_sum = ttk.Entry(frm, textvariable=self.var_summary)
         ent_sum.grid(row=1, column=0, sticky="ew", pady=(2, 10))
 
-        # Import Joined
         ttk.Label(frm, text=f"Import Joined String (delimiter: '{self.delimiter}')").grid(
             row=2, column=0, sticky="w"
         )
@@ -277,31 +271,31 @@ class KeywordDialog(tk.Toplevel):
         )
         self.ent_import.bind("<Return>", lambda _e: self._import_joined_to_parts(ask_confirm=True))
 
-        # Parts label
         ttk.Label(frm, text=f"Keyword Parts (구분자: '{self.delimiter}')").grid(row=4, column=0, sticky="w")
 
-        # Parts area: fixed height + scroll
         parts_outer = ttk.Frame(frm)
         parts_outer.grid(row=5, column=0, sticky="ew", pady=(2, 6))
         parts_outer.columnconfigure(0, weight=1)
         parts_outer.rowconfigure(0, weight=1)
 
-        self.parts_canvas = tk.Canvas(parts_outer, height=PARTS_AREA_HEIGHT_PX, highlightthickness=1, highlightbackground="#c0c0c0")
+        self.parts_canvas = tk.Canvas(
+            parts_outer,
+            height=PARTS_AREA_HEIGHT_PX,
+            highlightthickness=1,
+            highlightbackground="#c0c0c0",
+        )
         self.parts_canvas.grid(row=0, column=0, sticky="ew")
 
         self.parts_scroll = ttk.Scrollbar(parts_outer, orient="vertical", command=self.parts_canvas.yview)
         self.parts_scroll.grid(row=0, column=1, sticky="ns", padx=(6, 0))
         self.parts_canvas.configure(yscrollcommand=self.parts_scroll.set)
 
-        # inner frame inside canvas
         self.parts_container = ttk.Frame(self.parts_canvas)
         self._parts_window_id = self.parts_canvas.create_window((0, 0), window=self.parts_container, anchor="nw")
 
-        # size/scroll sync
         self.parts_container.bind("<Configure>", self._on_parts_container_configure)
         self.parts_canvas.bind("<Configure>", self._on_parts_canvas_configure)
 
-        # mouse wheel scroll (windows/mac/linux)
         self._bind_mousewheel(self.parts_canvas)
         self._bind_mousewheel(self.parts_container)
 
@@ -309,7 +303,6 @@ class KeywordDialog(tk.Toplevel):
         add_btn_row.grid(row=6, column=0, sticky="w", pady=(0, 8))
         ttk.Button(add_btn_row, text="+ Add Part", command=self._add_part_row).pack(side=tk.LEFT)
 
-        # Preview
         ttk.Label(frm, text="Joined Keyword Preview (auto wrap, scrollable)").grid(
             row=7, column=0, sticky="w", pady=(6, 0)
         )
@@ -323,7 +316,7 @@ class KeywordDialog(tk.Toplevel):
             height=PREVIEW_MAX_LINES,
             wrap="word",
             relief="solid",
-            borderwidth=1
+            borderwidth=1,
         )
         self.preview_text.grid(row=0, column=0, sticky="ew")
         self.preview_text.configure(state="disabled")
@@ -332,7 +325,6 @@ class KeywordDialog(tk.Toplevel):
         self.preview_scroll.grid(row=0, column=1, sticky="ns", padx=(6, 0))
         self.preview_text.configure(yscrollcommand=self.preview_scroll.set)
 
-        # Description
         ttk.Label(frm, text="Description (긴 설명, Info 팝업으로 표시)").grid(row=9, column=0, sticky="w")
         self.txt_desc = tk.Text(frm, height=10, wrap="word")
         self.txt_desc.grid(row=10, column=0, sticky="nsew", pady=(2, 10))
@@ -346,7 +338,6 @@ class KeywordDialog(tk.Toplevel):
         frm.columnconfigure(0, weight=1)
         frm.rowconfigure(10, weight=1)
 
-        # Build initial part rows
         initial_parts = keyword_parts_from_kw(init, self.delimiter)
         if not initial_parts:
             initial_parts = [""]
@@ -354,7 +345,6 @@ class KeywordDialog(tk.Toplevel):
         for p in initial_parts:
             self._add_part_row(initial_text=p)
 
-        # convenience: fill import box with current joined (optional)
         try:
             self.var_import_joined.set(self.delimiter.join([x for x in initial_parts if str(x).strip()]))
         except Exception:
@@ -368,16 +358,13 @@ class KeywordDialog(tk.Toplevel):
         ent_sum.focus_set()
         self.wait_window(self)
 
-    # ---------- Scroll helpers ----------
     def _on_parts_container_configure(self, _event=None):
-        # Update scrollregion
         try:
             self.parts_canvas.configure(scrollregion=self.parts_canvas.bbox("all"))
         except Exception:
             pass
 
     def _on_parts_canvas_configure(self, event=None):
-        # Make inner frame width match canvas width
         try:
             w = event.width if event else self.parts_canvas.winfo_width()
             self.parts_canvas.itemconfigure(self._parts_window_id, width=w)
@@ -385,12 +372,10 @@ class KeywordDialog(tk.Toplevel):
             pass
 
     def _bind_mousewheel(self, widget):
-        # Windows/Mac: <MouseWheel>, Linux: <Button-4/5>
         widget.bind("<Enter>", lambda _e: self._activate_mousewheel(True))
         widget.bind("<Leave>", lambda _e: self._activate_mousewheel(False))
 
     def _activate_mousewheel(self, active: bool):
-        # bind on toplevel so wheel works even when cursor is over child widgets
         if active:
             self.bind_all("<MouseWheel>", self._on_mousewheel, add="+")
             self.bind_all("<Button-4>", self._on_mousewheel_linux, add="+")
@@ -404,7 +389,6 @@ class KeywordDialog(tk.Toplevel):
                 pass
 
     def _on_mousewheel(self, event):
-        # Only scroll parts canvas when it can scroll
         try:
             self.parts_canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
         except Exception:
@@ -419,7 +403,6 @@ class KeywordDialog(tk.Toplevel):
         except Exception:
             pass
 
-    # ---------- Part rows ----------
     def _add_part_row(self, initial_text=""):
         row = ttk.Frame(self.parts_container)
         row.pack(fill=tk.X, pady=2)
@@ -436,7 +419,6 @@ class KeywordDialog(tk.Toplevel):
         ent.bind("<Control-v>", lambda e, w=ent: self._after_paste_offer_split(w))
         ent.bind("<Control-V>", lambda e, w=ent: self._after_paste_offer_split(w))
 
-        # ensure scrollregion updates
         self._on_parts_container_configure()
         self._update_preview()
 
@@ -486,20 +468,17 @@ class KeywordDialog(tk.Toplevel):
     def _set_parts_rows(self, parts: list[str]):
         self._clear_all_part_rows()
         if not parts:
-            parts = [""]  # keep at least one row
+            parts = [""]
         for p in parts:
             self._add_part_row(initial_text=p)
 
         self._on_parts_container_configure()
         self._update_preview()
-
-        # top of list for usability
         try:
             self.parts_canvas.yview_moveto(0.0)
         except Exception:
             pass
 
-    # ---------- Preview ----------
     def _set_preview_text(self, text: str):
         self.preview_text.configure(state="normal")
         self.preview_text.delete("1.0", "end")
@@ -516,7 +495,6 @@ class KeywordDialog(tk.Toplevel):
         self.var_join_preview.set(joined)
         self._set_preview_text(joined)
 
-    # ---------- Split / Import UX ----------
     def _split_by_delimiter(self, text: str) -> list[str]:
         delim = self.delimiter if self.delimiter is not None else DEFAULT_DELIMITER
         delim = str(delim)
@@ -603,7 +581,6 @@ class KeywordDialog(tk.Toplevel):
         finally:
             self._split_offer_inflight = False
 
-    # ---------- OK/Cancel ----------
     def _ok(self):
         parts = self._get_parts()
         if not parts:
@@ -866,19 +843,29 @@ class KeywordGuideApp(tk.Tk):
         right = ttk.Frame(root)
         right.grid(row=0, column=1, sticky="nsew", padx=(12, 0))
 
-        ttk.Label(right, text="Keywords: Summary / Keyword(Joined) / Preview(Rendered) / Info / Copy").grid(
+        ttk.Label(right, text="Keywords: Summary / Info / Copy / Keyword(Joined) / Preview(Rendered)").grid(
             row=0, column=0, sticky="w"
         )
 
         self.tree = ttk.Treeview(right, columns=KEYWORD_COLS, show="headings", height=13)
-        for c, t in zip(KEYWORD_COLS, ["Summary", "Keyword", "Preview", "Info", "Copy"]):
-            self.tree.heading(c, text=t)
 
+        # headings (순서 중요)
+        headings = {
+            "summary": "Summary",
+            "info": "Info",
+            "copy": "Copy",
+            "keyword": "Keyword",
+            "preview": "Preview",
+        }
+        for c in KEYWORD_COLS:
+            self.tree.heading(c, text=headings.get(c, c))
+
+        # columns
         self.tree.column("summary", width=DEFAULT_KEYWORD_COL_WIDTHS["summary"], anchor="w", stretch=True)
-        self.tree.column("keyword", width=DEFAULT_KEYWORD_COL_WIDTHS["keyword"], anchor="w", stretch=True)
-        self.tree.column("preview", width=DEFAULT_KEYWORD_COL_WIDTHS["preview"], anchor="w", stretch=True)
         self.tree.column("info", width=DEFAULT_KEYWORD_COL_WIDTHS["info"], anchor="center", stretch=False)
         self.tree.column("copy", width=DEFAULT_KEYWORD_COL_WIDTHS["copy"], anchor="center", stretch=False)
+        self.tree.column("keyword", width=DEFAULT_KEYWORD_COL_WIDTHS["keyword"], anchor="w", stretch=True)
+        self.tree.column("preview", width=DEFAULT_KEYWORD_COL_WIDTHS["preview"], anchor="w", stretch=True)
 
         self.tree.grid(row=1, column=0, sticky="nsew", pady=(4, 0))
         sb = ttk.Scrollbar(right, orient="vertical", command=self.tree.yview)
@@ -1049,7 +1036,14 @@ class KeywordGuideApp(tk.Tk):
             raw_joined = keyword_joined_template(kw, delim)
             summary = kw.get("summary", "")
             preview = render_keyword(raw_joined, params)
-            self.tree.insert("", "end", iid=str(idx), values=(summary, raw_joined, preview, "Info", "Copy"))
+
+            # 컬럼 순서: summary, info, copy, keyword, preview
+            self.tree.insert(
+                "",
+                "end",
+                iid=str(idx),
+                values=(summary, "Info", "Copy", raw_joined, preview),
+            )
 
         v, i, d = self.vendor_var.get(), self.issue_var.get(), self.detail_var.get()
         self.status_var.set(f"Selected: {v} > {i} > {d}")
@@ -1187,7 +1181,9 @@ class KeywordGuideApp(tk.Tk):
         delim = self._get_vendor_delimiter(v)
         raw_joined = keyword_joined_template(kw, delim)
 
-        if col == "#4":  # Info
+        # 컬럼 순서가 바뀌었으므로:
+        # #1 summary, #2 info, #3 copy, #4 keyword, #5 preview
+        if col == "#2":  # Info
             InfoPopup(
                 self,
                 title="Keyword Description",
@@ -1195,7 +1191,7 @@ class KeywordGuideApp(tk.Tk):
                 keyword=raw_joined,
                 desc=kw.get("desc", ""),
             )
-        elif col == "#5":  # Copy
+        elif col == "#3":  # Copy
             rendered = render_keyword(raw_joined, params)
             self.clipboard_clear()
             self.clipboard_append(rendered)
@@ -1204,7 +1200,7 @@ class KeywordGuideApp(tk.Tk):
 
     def on_tree_double_click(self, event):
         col = self.tree.identify_column(event.x)
-        if col in ("#4", "#5"):
+        if col in ("#2", "#3"):  # Info/Copy는 더블클릭 edit 방지
             return
         self.edit_keyword()
 
@@ -1217,7 +1213,8 @@ class KeywordGuideApp(tk.Tk):
         try:
             vals = list(self.tree.item(row_iid, "values"))
             if len(vals) == len(KEYWORD_COLS):
-                vals[4] = "Copied"
+                # copy 컬럼 index=2 (0-based)
+                vals[2] = "Copied"
                 self.tree.item(row_iid, values=tuple(vals))
         except Exception:
             pass
@@ -1253,7 +1250,7 @@ class KeywordGuideApp(tk.Tk):
         try:
             vals = list(self.tree.item(row_iid, "values"))
             if len(vals) == len(KEYWORD_COLS):
-                vals[4] = "Copy"
+                vals[2] = "Copy"
                 self.tree.item(row_iid, values=tuple(vals))
         except Exception:
             pass
