@@ -1,18 +1,25 @@
 # ============================================================
 # Keyword Guide UI POC
 # ------------------------------------------------------------
-# Version: 0.3.9 (2025-12-26)
+# Version: 0.4.1 (2025-12-26)
 #
-# Release Notes (v0.3.9)
-# 1) Keyword List: 왼쪽(#0) 체크박스 표시 추가 (selection과 동기화)
-#    - 체크박스 클릭으로 selection 토글 (multi-select 유지)
-# 2) Select All / Clear All 버튼 추가
-# 3) Copy Selected: "체크된 항목(=selection)"들을 delimiter로 join하여 copy
+# Release Notes (v0.4.1)
+# - (FIX) Tree selection bug: selecting rows beyond the first sometimes didn't work.
+#   Root cause: on_keyword_select() called refresh_keywords() which rebuilds the tree and
+#   clears selection immediately. Now we do NOT rebuild the tree on selection changes.
+#   Instead, we update only preview column via refresh_keyword_previews_only().
 #
-# Existing (v0.3.8 유지)
-# - Keyword List View 컬럼: Summary | Info | Copy | Preview
-# - Up/Down 버튼: 단일 선택(첫 선택) 기준 swap + 저장
-# - KeywordDialog: Parts 고정 높이 + 스크롤, Preview wrap+스크롤
+# Existing (v0.4.0 유지)
+# - Keyword Description Rich Text 지원 (Bold + 3 Colors) with desc_rich runs 저장/로드
+# - Keyword List: 왼쪽(#0) 체크박스 + extended selection
+# - Select All / Clear All / Copy Selected(선택된 rendered들을 vendor delimiter로 join)
+# - Up/Down(단일 선택 1개 기준) 위치 변경
+# - Vendor별 Issue 관리 + Vendor별 Delimiter 저장
+# - Keyword CRUD / Copy feedback (Copied bold)
+# - Placeholder detect + Inline Apply (category-level params)
+# - Category-level params in-place edit (Enter/Esc)
+# - UI state persistence
+# - KeywordDialog: Parts fixed height + scroll, Preview wrap+scroll
 # - Import Joined String split: 확인 후 적용
 # - Part 입력 중 delimiter 포함 시 split 제안: 확인 후 적용(자동 아님)
 # ============================================================
@@ -50,11 +57,12 @@ DEFAULT_PARAM_COL_WIDTHS = {"pname": 140, "pval": 280}
 COPY_FEEDBACK_MS = 900
 DEFAULT_DELIMITER = ";"
 
-# KeywordDialog Preview UI
+# KeywordDialog UI
 PREVIEW_MAX_LINES = 4
-
-# KeywordDialog Parts area (scrollable fixed height)
 PARTS_AREA_HEIGHT_PX = 160
+
+# Description Rich tags
+DESC_COLOR_KEYS = ("black", "red", "blue")
 
 
 # ------------------------------------------------------------
@@ -158,7 +166,28 @@ def ensure_issue_config_vendor_scoped(cfg: dict, vendors: list[str]):
     return cfg
 
 
+def _desc_plain_from_rich(runs):
+    if not isinstance(runs, list):
+        return ""
+    out = []
+    for r in runs:
+        if isinstance(r, dict):
+            t = r.get("text", "")
+            if t:
+                out.append(str(t))
+    return "".join(out)
+
+
 def normalize_keywords(lst):
+    """
+    Normalize keyword list items to dict:
+      legacy: {"summary":..., "desc":..., "text":...}
+      new:    {"summary":..., "desc":..., "desc_rich":[...], "parts":[...]}
+    Backward compatible:
+      - string -> {"text": str, "summary":"", "desc":""}
+      - {"text","desc"} / {"text","description"}
+      - {"parts":[...]} -> keep parts (trim-only, allow duplicates)
+    """
     out = []
     for item in lst or []:
         if isinstance(item, str):
@@ -171,17 +200,29 @@ def normalize_keywords(lst):
             continue
 
         summary = str(item.get("summary", "")).strip()
+
+        desc_rich = item.get("desc_rich", None)
         desc = str(item.get("desc", item.get("description", ""))).strip()
+
+        if isinstance(desc_rich, list) and desc_rich:
+            if not desc:
+                desc = _desc_plain_from_rich(desc_rich).strip()
 
         if "parts" in item and isinstance(item.get("parts"), list):
             parts = _clean_str_list_keep_order(item.get("parts"))
             if parts:
-                out.append({"parts": parts, "summary": summary, "desc": desc})
+                kw = {"parts": parts, "summary": summary, "desc": desc}
+                if isinstance(desc_rich, list) and desc_rich:
+                    kw["desc_rich"] = desc_rich
+                out.append(kw)
                 continue
 
         text = str(item.get("text", "")).strip()
         if text:
-            out.append({"text": text, "summary": summary, "desc": desc})
+            kw = {"text": text, "summary": summary, "desc": desc}
+            if isinstance(desc_rich, list) and desc_rich:
+                kw["desc_rich"] = desc_rich
+            out.append(kw)
 
     return out
 
@@ -224,7 +265,12 @@ class KeywordDialog(tk.Toplevel):
     Split UX:
       - Import Joined String split: 확인 후 적용
       - Part 입력 중 delimiter 포함: 확인 후 split 제안(자동 아님)
+
+    Description Rich:
+      - Bold + 3 colors (black/red/blue) via Text tags
+      - 저장: desc_rich runs + desc plain 유지
     """
+
     def __init__(self, parent, title, init=None, delimiter=";"):
         super().__init__(parent)
         self.title(title)
@@ -316,19 +362,34 @@ class KeywordDialog(tk.Toplevel):
         self.preview_scroll.grid(row=0, column=1, sticky="ns", padx=(6, 0))
         self.preview_text.configure(yscrollcommand=self.preview_scroll.set)
 
-        ttk.Label(frm, text="Description (긴 설명, Info 팝업으로 표시)").grid(row=9, column=0, sticky="w")
+        # ---- Description toolbar (rich text) ----
+        ttk.Label(frm, text="Description (Bold + Color, Info 팝업으로 표시)").grid(row=9, column=0, sticky="w")
+        desc_toolbar = ttk.Frame(frm)
+        desc_toolbar.grid(row=10, column=0, sticky="w", pady=(4, 2))
+
+        ttk.Button(desc_toolbar, text="B", width=3, command=self._toggle_bold).pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Button(desc_toolbar, text="Black", command=lambda: self._apply_color("black")).pack(side=tk.LEFT, padx=2)
+        ttk.Button(desc_toolbar, text="Red", command=lambda: self._apply_color("red")).pack(side=tk.LEFT, padx=2)
+        ttk.Button(desc_toolbar, text="Blue", command=lambda: self._apply_color("blue")).pack(side=tk.LEFT, padx=2)
+
         self.txt_desc = tk.Text(frm, height=10, wrap="word")
-        self.txt_desc.grid(row=10, column=0, sticky="nsew", pady=(2, 10))
-        self.txt_desc.insert("1.0", str(init.get("desc", "")))
+        self.txt_desc.grid(row=11, column=0, sticky="nsew", pady=(2, 10))
+
+        # tags
+        self.txt_desc.tag_configure("b", font=("TkDefaultFont", 9, "bold"))
+        self.txt_desc.tag_configure("c_black", foreground="black")
+        self.txt_desc.tag_configure("c_red", foreground="red")
+        self.txt_desc.tag_configure("c_blue", foreground="blue")
 
         btns = ttk.Frame(frm)
-        btns.grid(row=11, column=0, sticky="e")
+        btns.grid(row=12, column=0, sticky="e")
         ttk.Button(btns, text="Cancel", command=self._cancel).pack(side=tk.LEFT, padx=6)
         ttk.Button(btns, text="OK", command=self._ok).pack(side=tk.LEFT)
 
         frm.columnconfigure(0, weight=1)
-        frm.rowconfigure(10, weight=1)
+        frm.rowconfigure(11, weight=1)
 
+        # Build initial part rows
         initial_parts = keyword_parts_from_kw(init, self.delimiter)
         if not initial_parts:
             initial_parts = [""]
@@ -343,12 +404,20 @@ class KeywordDialog(tk.Toplevel):
 
         self._set_preview_text(self.delimiter.join(self._get_parts()))
 
+        # Load description (rich preferred)
+        desc_rich = init.get("desc_rich", None)
+        if isinstance(desc_rich, list) and desc_rich:
+            self._apply_desc_rich(desc_rich)
+        else:
+            self.txt_desc.insert("1.0", str(init.get("desc", "")))
+
         self.transient(parent)
         self.grab_set()
         self.protocol("WM_DELETE_WINDOW", self._cancel)
         ent_sum.focus_set()
         self.wait_window(self)
 
+    # ---------------- Parts scrolling ----------------
     def _on_parts_container_configure(self, _event=None):
         try:
             self.parts_canvas.configure(scrollregion=self.parts_canvas.bbox("all"))
@@ -394,6 +463,7 @@ class KeywordDialog(tk.Toplevel):
         except Exception:
             pass
 
+    # ---------------- Parts CRUD ----------------
     def _add_part_row(self, initial_text=""):
         row = ttk.Frame(self.parts_container)
         row.pack(fill=tk.X, pady=2)
@@ -470,6 +540,7 @@ class KeywordDialog(tk.Toplevel):
         except Exception:
             pass
 
+    # ---------------- Preview ----------------
     def _set_preview_text(self, text: str):
         self.preview_text.configure(state="normal")
         self.preview_text.delete("1.0", "end")
@@ -484,6 +555,7 @@ class KeywordDialog(tk.Toplevel):
         joined = self.delimiter.join(self._get_parts())
         self._set_preview_text(joined)
 
+    # ---------------- Split UX ----------------
     def _split_by_delimiter(self, text: str) -> list[str]:
         delim = self.delimiter if self.delimiter is not None else DEFAULT_DELIMITER
         delim = str(delim)
@@ -569,16 +641,120 @@ class KeywordDialog(tk.Toplevel):
         finally:
             self._split_offer_inflight = False
 
+    # ---------------- Description Rich ----------------
+    def _get_sel_range(self):
+        try:
+            start = self.txt_desc.index("sel.first")
+            end = self.txt_desc.index("sel.last")
+            return start, end
+        except Exception:
+            return None
+
+    def _toggle_tag(self, tag: str, start: str, end: str):
+        has_any = False
+        idx = start
+        while self.txt_desc.compare(idx, "<", end):
+            tags = self.txt_desc.tag_names(idx)
+            if tag in tags:
+                has_any = True
+                break
+            idx = self.txt_desc.index(f"{idx}+1c")
+
+        if has_any:
+            self.txt_desc.tag_remove(tag, start, end)
+        else:
+            self.txt_desc.tag_add(tag, start, end)
+
+    def _toggle_bold(self):
+        rng = self._get_sel_range()
+        if rng:
+            self._toggle_tag("b", rng[0], rng[1])
+            return
+
+        start = self.txt_desc.index("insert linestart")
+        end = self.txt_desc.index("insert lineend")
+        self._toggle_tag("b", start, end)
+
+    def _apply_color(self, color_name: str):
+        if color_name not in DESC_COLOR_KEYS:
+            return
+
+        rng = self._get_sel_range()
+        if rng:
+            start, end = rng
+        else:
+            start = self.txt_desc.index("insert linestart")
+            end = self.txt_desc.index("insert lineend")
+
+        for t in ("c_black", "c_red", "c_blue"):
+            self.txt_desc.tag_remove(t, start, end)
+
+        self.txt_desc.tag_add(f"c_{color_name}", start, end)
+
+    def _serialize_desc_rich(self):
+        text = self.txt_desc.get("1.0", "end-1c")
+        if not text:
+            return []
+
+        runs = []
+        cur = None
+
+        for i, ch in enumerate(text):
+            idx = f"1.0+{i}c"
+            tags = set(self.txt_desc.tag_names(idx))
+
+            b = ("b" in tags)
+            c = "black"
+            if "c_red" in tags:
+                c = "red"
+            elif "c_blue" in tags:
+                c = "blue"
+            elif "c_black" in tags:
+                c = "black"
+
+            if cur and cur["b"] == b and cur["c"] == c:
+                cur["text"] += ch
+            else:
+                cur = {"text": ch, "b": b, "c": c}
+                runs.append(cur)
+
+        return [r for r in runs if r.get("text")]
+
+    def _apply_desc_rich(self, runs: list[dict]):
+        self.txt_desc.delete("1.0", "end")
+        for r in runs:
+            if not isinstance(r, dict):
+                continue
+            t = str(r.get("text", ""))
+            if not t:
+                continue
+
+            start = self.txt_desc.index("end-1c")
+            self.txt_desc.insert("end", t)
+            end = self.txt_desc.index("end-1c")
+
+            if r.get("b"):
+                self.txt_desc.tag_add("b", start, end)
+
+            c = r.get("c", "black")
+            if c in DESC_COLOR_KEYS:
+                self.txt_desc.tag_add(f"c_{c}", start, end)
+
+    # ---------------- OK / Cancel ----------------
     def _ok(self):
         parts = self._get_parts()
         if not parts:
             messagebox.showwarning("Warning", "At least one non-empty part is required.")
             return
 
+        desc_plain = self.txt_desc.get("1.0", "end-1c").strip()
+        desc_rich = self._serialize_desc_rich()
+
         self.result = {
             "parts": parts,
             "summary": self.var_summary.get().strip(),
-            "desc": self.txt_desc.get("1.0", "end-1c").strip(),
+            "desc": desc_plain,          # legacy 유지
+            "desc_rich": desc_rich,      # 신규 rich
         }
         self.destroy()
 
@@ -591,10 +767,10 @@ class KeywordDialog(tk.Toplevel):
 # Info Popup
 # ------------------------------------------------------------
 class InfoPopup(tk.Toplevel):
-    def __init__(self, parent, title: str, summary: str, keyword: str, desc: str):
+    def __init__(self, parent, title: str, summary: str, keyword: str, desc: str, desc_rich=None):
         super().__init__(parent)
         self.title(title)
-        self.geometry("780x420")
+        self.geometry("820x480")
 
         frm = ttk.Frame(self, padding=12)
         frm.pack(fill=tk.BOTH, expand=True)
@@ -611,7 +787,30 @@ class InfoPopup(tk.Toplevel):
         ttk.Label(frm, text="Description").grid(row=4, column=0, sticky="w")
         txt = tk.Text(frm, wrap="word")
         txt.grid(row=5, column=0, sticky="nsew")
-        txt.insert("1.0", desc or "")
+
+        txt.tag_configure("b", font=("TkDefaultFont", 9, "bold"))
+        txt.tag_configure("c_black", foreground="black")
+        txt.tag_configure("c_red", foreground="red")
+        txt.tag_configure("c_blue", foreground="blue")
+
+        if isinstance(desc_rich, list) and desc_rich:
+            for r in desc_rich:
+                if not isinstance(r, dict):
+                    continue
+                t = str(r.get("text", ""))
+                if not t:
+                    continue
+                start = txt.index("end-1c")
+                txt.insert("end", t)
+                end = txt.index("end-1c")
+                if r.get("b"):
+                    txt.tag_add("b", start, end)
+                c = r.get("c", "black")
+                if c in DESC_COLOR_KEYS:
+                    txt.tag_add(f"c_{c}", start, end)
+        else:
+            txt.insert("1.0", desc or "")
+
         txt.configure(state="disabled")
 
         btns = ttk.Frame(frm)
@@ -883,7 +1082,6 @@ class KeywordGuideApp(tk.Tk):
             row=0, column=0, sticky="w"
         )
 
-        # show="tree headings" to expose #0 (checkbox)
         self.tree = ttk.Treeview(
             right,
             columns=KEYWORD_COLS,
@@ -892,16 +1090,10 @@ class KeywordGuideApp(tk.Tk):
             selectmode="extended",
         )
 
-        # checkbox column (#0)
         self.tree.heading("#0", text="")
         self.tree.column("#0", width=34, anchor="center", stretch=False)
 
-        headings = {
-            "summary": "Summary",
-            "info": "Info",
-            "copy": "Copy",
-            "preview": "Preview",
-        }
+        headings = {"summary": "Summary", "info": "Info", "copy": "Copy", "preview": "Preview"}
         for c in KEYWORD_COLS:
             self.tree.heading(c, text=headings.get(c, c))
 
@@ -923,8 +1115,6 @@ class KeywordGuideApp(tk.Tk):
         self.tree.bind("<Button-1>", self.on_tree_click)
         self.tree.bind("<Double-1>", self.on_tree_double_click)
         self.tree.bind("<<TreeviewSelect>>", self.on_keyword_select)
-
-        # Bulk copy shortcut
         self.tree.bind("<Control-c>", self.copy_selected_keywords)
         self.tree.bind("<Control-C>", self.copy_selected_keywords)
 
@@ -1106,6 +1296,29 @@ class KeywordGuideApp(tk.Tk):
         v, i, d = self.vendor_var.get(), self.issue_var.get(), self.detail_var.get()
         self.status_var.set(f"Selected: {v} > {i} > {d}")
 
+    def refresh_keyword_previews_only(self):
+        """Treeview 전체 재생성 없이 preview 컬럼만 업데이트"""
+        obj = self._current_obj()
+        params = obj["_params"]
+        v = self.vendor_var.get()
+        delim = self._get_vendor_delimiter(v)
+
+        for iid in self.tree.get_children(""):
+            try:
+                idx = int(iid)
+            except Exception:
+                continue
+            if idx < 0 or idx >= len(obj["_keywords"]):
+                continue
+
+            kw = obj["_keywords"][idx]
+            raw_joined = keyword_joined_template(kw, delim)
+            preview = render_keyword(raw_joined, params)
+            try:
+                self.tree.set(iid, "preview", preview)
+            except Exception:
+                pass
+
     def refresh_params(self):
         self.param_tree.delete(*self.param_tree.get_children())
         params = self._current_obj()["_params"]
@@ -1123,6 +1336,7 @@ class KeywordGuideApp(tk.Tk):
         )
 
     def on_keyword_select(self, *_):
+        # IMPORTANT: do NOT rebuild tree here. Only update inline panel and preview cells.
         self._sync_checkboxes_with_selection()
 
         for w in self.inline_box.winfo_children():
@@ -1140,6 +1354,10 @@ class KeywordGuideApp(tk.Tk):
             return
 
         obj = self._current_obj()
+        if idx < 0 or idx >= len(obj["_keywords"]):
+            self.clear_inline()
+            return
+
         kw = obj["_keywords"][idx]
 
         v = self.vendor_var.get()
@@ -1170,15 +1388,16 @@ class KeywordGuideApp(tk.Tk):
                 side=tk.LEFT
             )
 
-        self.refresh_keywords()
+        # update only params panel + previews (no tree rebuild)
         self.refresh_params()
+        self.refresh_keyword_previews_only()
 
     def apply_inline_param(self, key, value):
         obj = self._current_obj()
         obj["_params"][key] = value
         self._persist_db(f"Param updated: {key}={value}")
-        self.refresh_keywords()
         self.refresh_params()
+        self.refresh_keyword_previews_only()
 
     # --------------------------------------------------------
     # Select All / Clear All
@@ -1352,13 +1571,19 @@ class KeywordGuideApp(tk.Tk):
         if not row:
             return
 
-        # checkbox column (#0)
         if col == "#0":
             self._toggle_checkbox_row(row)
             return "break"
 
-        idx = int(row)
+        try:
+            idx = int(row)
+        except Exception:
+            return
+
         obj = self._current_obj()
+        if idx < 0 or idx >= len(obj["_keywords"]):
+            return
+
         params = obj["_params"]
         kw = obj["_keywords"][idx]
 
@@ -1374,6 +1599,7 @@ class KeywordGuideApp(tk.Tk):
                 summary=kw.get("summary", ""),
                 keyword=raw_joined,
                 desc=kw.get("desc", ""),
+                desc_rich=kw.get("desc_rich", None),
             )
         elif col == "#3":  # Copy
             rendered = render_keyword(raw_joined, params)
@@ -1463,7 +1689,7 @@ class KeywordGuideApp(tk.Tk):
         obj["_params"][name] = val
         self._persist_db("Param added")
         self.refresh_params()
-        self.refresh_keywords()
+        self.refresh_keyword_previews_only()
 
     def remove_param(self):
         sel = self.param_tree.selection()
@@ -1481,7 +1707,7 @@ class KeywordGuideApp(tk.Tk):
         del obj["_params"][pname]
         self._persist_db("Param removed")
         self.refresh_params()
-        self.refresh_keywords()
+        self.refresh_keyword_previews_only()
 
     # --------------------------------------------------------
     # Param in-place edit
@@ -1526,7 +1752,7 @@ class KeywordGuideApp(tk.Tk):
         self._persist_db(f"Param updated: {self._param_editing}={new_val}")
         self._cancel_param_edit()
         self.refresh_params()
-        self.refresh_keywords()
+        self.refresh_keyword_previews_only()
         self.param_tree.selection_set(self._param_editing)
 
     def _cancel_param_edit(self):
@@ -1720,7 +1946,6 @@ class KeywordGuideApp(tk.Tk):
                 except Exception:
                     pass
 
-        # (#0 checkbox column width)
         try:
             w0 = self.ui_state.get("keyword_tree_col0_width", 34)
             self.tree.column("#0", width=int(w0))
