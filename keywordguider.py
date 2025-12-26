@@ -1,15 +1,15 @@
 # ============================================================
 # Keyword Guide UI POC
 # ------------------------------------------------------------
-# Version: 0.3.5 (2025-12-26)
+# Version: 0.3.6 (2025-12-26)
 #
-# Release Notes (v0.3.5)
-# 1) Keyword list(Treeview) 컬럼 순서 변경
-#    - 기존: Summary | Keyword | Preview | Info | Copy
-#    - 변경: Summary | Info | Copy | Keyword | Preview
-#    - 목적: Info/Copy가 화면 오른쪽에서 잘리는 UX 개선
+# Release Notes (v0.3.6)
+# 1) Keyword List View 컬럼 단순화
+#    - 기존(v0.3.5): Summary | Info | Copy | Keyword | Preview
+#    - 변경(v0.3.6): Summary | Info | Copy | Preview
+#    - 목적: 리스트 뷰에서 핵심 UX만 노출(가로 잘림 최소화)
 #
-# 2) v0.3.4 기능 유지
+# 2) v0.3.5 기능 유지
 #    - KeywordDialog: Parts 영역 고정 높이 + 스크롤 (창 height 폭증 방지)
 #    - Preview: wrap + 고정 lines + 스크롤
 #    - Import Joined String split: 확인 후 적용
@@ -40,15 +40,14 @@ ISSUES_PATH = BASE_DIR / "issues_config.json"
 PLACEHOLDER_RE = re.compile(r"\{([A-Za-z0-9_]+)\}")
 DEFAULT_GEOMETRY = "1250x760"
 
-# 컬럼 순서 변경: Summary | Info | Copy | Keyword | Preview
-KEYWORD_COLS = ("summary", "info", "copy", "keyword", "preview")
+# Keyword list view: Summary | Info | Copy | Preview
+KEYWORD_COLS = ("summary", "info", "copy", "preview")
 
 DEFAULT_KEYWORD_COL_WIDTHS = {
-    "summary": 220,
+    "summary": 260,
     "info": 70,
     "copy": 70,
-    "keyword": 420,
-    "preview": 360,
+    "preview": 700,
 }
 
 PARAM_COLS = ("pname", "pval")
@@ -615,7 +614,10 @@ class InfoPopup(tk.Toplevel):
         ttk.Label(frm, text=summary or "(empty)").grid(row=1, column=0, sticky="w", pady=(0, 10))
 
         ttk.Label(frm, text="Keyword").grid(row=2, column=0, sticky="w")
-        ttk.Label(frm, text=keyword).grid(row=3, column=0, sticky="w", pady=(0, 10))
+        txt_kw = tk.Text(frm, wrap="word", height=4)
+        txt_kw.grid(row=3, column=0, sticky="nsew", pady=(0, 10))
+        txt_kw.insert("1.0", keyword or "")
+        txt_kw.configure(state="disabled")
 
         ttk.Label(frm, text="Description").grid(row=4, column=0, sticky="w")
         txt = tk.Text(frm, wrap="word")
@@ -843,28 +845,22 @@ class KeywordGuideApp(tk.Tk):
         right = ttk.Frame(root)
         right.grid(row=0, column=1, sticky="nsew", padx=(12, 0))
 
-        ttk.Label(right, text="Keywords: Summary / Info / Copy / Keyword(Joined) / Preview(Rendered)").grid(
-            row=0, column=0, sticky="w"
-        )
+        ttk.Label(right, text="Keywords: Summary / Info / Copy / Preview(Rendered)").grid(row=0, column=0, sticky="w")
 
         self.tree = ttk.Treeview(right, columns=KEYWORD_COLS, show="headings", height=13)
 
-        # headings (순서 중요)
         headings = {
             "summary": "Summary",
             "info": "Info",
             "copy": "Copy",
-            "keyword": "Keyword",
             "preview": "Preview",
         }
         for c in KEYWORD_COLS:
             self.tree.heading(c, text=headings.get(c, c))
 
-        # columns
-        self.tree.column("summary", width=DEFAULT_KEYWORD_COL_WIDTHS["summary"], anchor="w", stretch=True)
+        self.tree.column("summary", width=DEFAULT_KEYWORD_COL_WIDTHS["summary"], anchor="w", stretch=False)
         self.tree.column("info", width=DEFAULT_KEYWORD_COL_WIDTHS["info"], anchor="center", stretch=False)
         self.tree.column("copy", width=DEFAULT_KEYWORD_COL_WIDTHS["copy"], anchor="center", stretch=False)
-        self.tree.column("keyword", width=DEFAULT_KEYWORD_COL_WIDTHS["keyword"], anchor="w", stretch=True)
         self.tree.column("preview", width=DEFAULT_KEYWORD_COL_WIDTHS["preview"], anchor="w", stretch=True)
 
         self.tree.grid(row=1, column=0, sticky="nsew", pady=(4, 0))
@@ -1037,13 +1033,8 @@ class KeywordGuideApp(tk.Tk):
             summary = kw.get("summary", "")
             preview = render_keyword(raw_joined, params)
 
-            # 컬럼 순서: summary, info, copy, keyword, preview
-            self.tree.insert(
-                "",
-                "end",
-                iid=str(idx),
-                values=(summary, "Info", "Copy", raw_joined, preview),
-            )
+            # list view: summary, info, copy, preview
+            self.tree.insert("", "end", iid=str(idx), values=(summary, "Info", "Copy", preview))
 
         v, i, d = self.vendor_var.get(), self.issue_var.get(), self.detail_var.get()
         self.status_var.set(f"Selected: {v} > {i} > {d}")
@@ -1181,8 +1172,7 @@ class KeywordGuideApp(tk.Tk):
         delim = self._get_vendor_delimiter(v)
         raw_joined = keyword_joined_template(kw, delim)
 
-        # 컬럼 순서가 바뀌었으므로:
-        # #1 summary, #2 info, #3 copy, #4 keyword, #5 preview
+        # columns: #1 summary, #2 info, #3 copy, #4 preview
         if col == "#2":  # Info
             InfoPopup(
                 self,
@@ -1213,7 +1203,7 @@ class KeywordGuideApp(tk.Tk):
         try:
             vals = list(self.tree.item(row_iid, "values"))
             if len(vals) == len(KEYWORD_COLS):
-                # copy 컬럼 index=2 (0-based)
+                # copy 컬럼 index=2 (0-based): (summary, info, copy, preview)
                 vals[2] = "Copied"
                 self.tree.item(row_iid, values=tuple(vals))
         except Exception:
@@ -1531,7 +1521,8 @@ class KeywordGuideApp(tk.Tk):
     def _apply_saved_widths(self):
         cols = self.ui_state.get("keyword_tree_cols", {})
         for c, w in cols.items():
-            if c in DEFAULT_KEYWORD_COL_WIDTHS:
+            # 과거 state에 keyword 컬럼이 있어도 무시되도록 현재 컬럼만 반영
+            if c in DEFAULT_KEYWORD_COL_WIDTHS and c in KEYWORD_COLS:
                 try:
                     self.tree.column(c, width=int(w))
                 except Exception:
@@ -1548,7 +1539,8 @@ class KeywordGuideApp(tk.Tk):
     def reset_ui_layout(self):
         self.geometry(DEFAULT_GEOMETRY)
         for c, w in DEFAULT_KEYWORD_COL_WIDTHS.items():
-            self.tree.column(c, width=w)
+            if c in KEYWORD_COLS:
+                self.tree.column(c, width=w)
         for c, w in DEFAULT_PARAM_COL_WIDTHS.items():
             self.param_tree.column(c, width=w)
         self.status_var.set("UI layout reset to defaults.")
@@ -1556,7 +1548,7 @@ class KeywordGuideApp(tk.Tk):
     def on_close(self):
         state = {
             "geometry": self.geometry(),
-            "keyword_tree_cols": {c: self.tree.column(c, "width") for c in DEFAULT_KEYWORD_COL_WIDTHS},
+            "keyword_tree_cols": {c: self.tree.column(c, "width") for c in KEYWORD_COLS},
             "param_tree_cols": {c: self.param_tree.column(c, "width") for c in DEFAULT_PARAM_COL_WIDTHS},
         }
         save_json(UI_STATE_PATH, state)
