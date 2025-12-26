@@ -1,17 +1,18 @@
 # ============================================================
 # Keyword Guide UI POC
 # ------------------------------------------------------------
-# Version: 0.3.3 (2025-12-26)
+# Version: 0.3.4 (2025-12-26)
 #
-# Release Notes (v0.3.3)
-# 1) KeywordDialog Preview UX 개선 (유지)
-#    - Preview는 전체 문자열을 유지하되, 창 가로 폭 초과 시 자동 줄바꿈(wrap)
-#    - Preview 영역은 고정된 표시 줄 수(최대 N줄) + 세로 스크롤로 전체 확인
+# Release Notes (v0.3.4)
+# 1) KeywordDialog: Parts 영역이 Part 개수에 따라 무한히 커져서 창 하단이 짤리던 문제 해결
+#    - Parts 영역을 "고정 높이 + 세로 스크롤" 구조로 변경 (Canvas + Scrollbar)
+#    - Part row가 많아도 Dialog height는 과도하게 커지지 않음
+#    - 마우스휠로 Parts 영역 스크롤 지원 (Windows/Mac/Linux 기본 케이스 대응)
 #
-# 2) Joined String → Parts 자동 분해 UX 추가 (확인 후 적용)
-#    - "Import Joined String" 입력란 추가 + Split 버튼/Enter로 분해
-#    - Parts 입력 중(특히 1st part)에 delimiter 포함된 긴 문자열이 들어오면
-#      "Parts로 분해할까요?" 확인 팝업 후 적용(자동 적용 아님)
+# 2) 기존 v0.3.3 기능 유지
+#    - Preview: wrap + 고정 lines + 스크롤
+#    - Import Joined String split: 확인 후 적용
+#    - Part 입력 중 delimiter 포함 시: 확인 후 split 제안(자동 아님)
 #
 # Existing Features (유지)
 # - Vendor별 Issue 관리 + Vendor별 Delimiter 저장
@@ -54,7 +55,10 @@ COPY_FEEDBACK_MS = 900
 DEFAULT_DELIMITER = ";"
 
 # KeywordDialog Preview UI
-PREVIEW_MAX_LINES = 4  # Preview 고정 표시 줄 수(원하시면 3~6 정도로 조정)
+PREVIEW_MAX_LINES = 4
+
+# KeywordDialog Parts area (scrollable fixed height)
+PARTS_AREA_HEIGHT_PX = 160  # Part rows가 많아도 이 높이 안에서 스크롤로 확인
 
 
 # ------------------------------------------------------------
@@ -97,7 +101,6 @@ def default_issues():
 
 
 def _clean_str_list_keep_order(items):
-    # trim only, keep order, allow duplicates, drop empty
     out = []
     for it in items or []:
         s = str(it).strip()
@@ -142,7 +145,6 @@ def ensure_issue_config_vendor_scoped(cfg: dict, vendors: list[str]):
         if not isinstance(issues, list) or not issues:
             vobj["issues"] = default_issues()
         else:
-            # keep order, unique (avoid duplicate issue names)
             seen = set()
             cleaned = []
             for it in issues:
@@ -161,15 +163,6 @@ def ensure_issue_config_vendor_scoped(cfg: dict, vendors: list[str]):
 
 
 def normalize_keywords(lst):
-    """
-    Normalize keyword list items to dict:
-      {"summary":..., "desc":..., "text":...}  (legacy)
-      {"summary":..., "desc":..., "parts":[...]} (new)
-    Backward compatible:
-      - string -> {"text": str, "summary":"", "desc":""}
-      - {"text","desc"} / {"text","description"}
-      - {"parts":[...]} -> keep parts (trim-only, allow duplicates)
-    """
     out = []
     for item in lst or []:
         if isinstance(item, str):
@@ -226,16 +219,16 @@ class KeywordDialog(tk.Toplevel):
     """
     Keyword input supports multiple parts via dynamic +/- rows.
 
-    Preview UX:
-      - Full preview shown (no truncation)
-      - Wrap to next line when dialog width is exceeded
-      - Show only up to PREVIEW_MAX_LINES lines in view (fixed height),
-        with vertical scrollbar to inspect long preview.
+    Parts 영역:
+      - 고정 height + vertical scroll (Canvas)
+      - Part row 많아도 Dialog height 폭증 방지
 
-    Joined String -> Parts UX:
-      - "Import Joined String" entry + Split button/Enter (confirm then apply)
-      - If user pastes/types joined string with delimiter into Part entry,
-        offer confirm popup then apply (not automatic).
+    Preview:
+      - wrap + 고정 lines + vertical scroll
+
+    Split UX:
+      - Import Joined String split: 확인 후 적용
+      - Part 입력 중 delimiter 포함: 확인 후 split 제안(자동 아님)
     """
     def __init__(self, parent, title, init=None, delimiter=";"):
         super().__init__(parent)
@@ -249,17 +242,16 @@ class KeywordDialog(tk.Toplevel):
         self.var_summary = tk.StringVar(value=str(init.get("summary", "")))
         self.var_join_preview = tk.StringVar(value="")
 
-        # split-offer throttle
         self._last_split_offer_text = None
         self._split_offer_inflight = False
 
         frm = ttk.Frame(self, padding=12)
         frm.pack(fill=tk.BOTH, expand=True)
 
-        # Row mapping:
+        # Layout rows:
         # 0/1 Summary
         # 2/3 Import Joined
-        # 4/5 Parts
+        # 4/5 Parts (scroll)
         # 6/7 Preview
         # 8/9 Description
         # 10 Buttons
@@ -268,7 +260,7 @@ class KeywordDialog(tk.Toplevel):
         ent_sum = ttk.Entry(frm, textvariable=self.var_summary)
         ent_sum.grid(row=1, column=0, sticky="ew", pady=(2, 10))
 
-        # --- Import joined string -> split into parts
+        # Import Joined
         ttk.Label(frm, text=f"Import Joined String (delimiter: '{self.delimiter}')").grid(
             row=2, column=0, sticky="w"
         )
@@ -285,32 +277,51 @@ class KeywordDialog(tk.Toplevel):
         )
         self.ent_import.bind("<Return>", lambda _e: self._import_joined_to_parts(ask_confirm=True))
 
-        # Parts area
+        # Parts label
         ttk.Label(frm, text=f"Keyword Parts (구분자: '{self.delimiter}')").grid(row=4, column=0, sticky="w")
 
-        parts_box = ttk.Frame(frm)
-        parts_box.grid(row=5, column=0, sticky="ew", pady=(2, 6))
-        parts_box.columnconfigure(0, weight=1)
+        # Parts area: fixed height + scroll
+        parts_outer = ttk.Frame(frm)
+        parts_outer.grid(row=5, column=0, sticky="ew", pady=(2, 6))
+        parts_outer.columnconfigure(0, weight=1)
+        parts_outer.rowconfigure(0, weight=1)
 
-        self.parts_container = ttk.Frame(parts_box)
-        self.parts_container.grid(row=0, column=0, sticky="ew")
-        self.parts_container.columnconfigure(0, weight=1)
+        self.parts_canvas = tk.Canvas(parts_outer, height=PARTS_AREA_HEIGHT_PX, highlightthickness=1, highlightbackground="#c0c0c0")
+        self.parts_canvas.grid(row=0, column=0, sticky="ew")
 
-        add_btn_row = ttk.Frame(parts_box)
-        add_btn_row.grid(row=1, column=0, sticky="w", pady=(6, 0))
+        self.parts_scroll = ttk.Scrollbar(parts_outer, orient="vertical", command=self.parts_canvas.yview)
+        self.parts_scroll.grid(row=0, column=1, sticky="ns", padx=(6, 0))
+        self.parts_canvas.configure(yscrollcommand=self.parts_scroll.set)
+
+        # inner frame inside canvas
+        self.parts_container = ttk.Frame(self.parts_canvas)
+        self._parts_window_id = self.parts_canvas.create_window((0, 0), window=self.parts_container, anchor="nw")
+
+        # size/scroll sync
+        self.parts_container.bind("<Configure>", self._on_parts_container_configure)
+        self.parts_canvas.bind("<Configure>", self._on_parts_canvas_configure)
+
+        # mouse wheel scroll (windows/mac/linux)
+        self._bind_mousewheel(self.parts_canvas)
+        self._bind_mousewheel(self.parts_container)
+
+        add_btn_row = ttk.Frame(frm)
+        add_btn_row.grid(row=6, column=0, sticky="w", pady=(0, 8))
         ttk.Button(add_btn_row, text="+ Add Part", command=self._add_part_row).pack(side=tk.LEFT)
 
         # Preview
-        ttk.Label(frm, text="Joined Keyword Preview (auto wrap, scrollable)").grid(row=6, column=0, sticky="w", pady=(6, 0))
+        ttk.Label(frm, text="Joined Keyword Preview (auto wrap, scrollable)").grid(
+            row=7, column=0, sticky="w", pady=(6, 0)
+        )
 
         preview_box = ttk.Frame(frm)
-        preview_box.grid(row=7, column=0, sticky="ew", pady=(2, 10))
+        preview_box.grid(row=8, column=0, sticky="ew", pady=(2, 10))
         preview_box.columnconfigure(0, weight=1)
 
         self.preview_text = tk.Text(
             preview_box,
             height=PREVIEW_MAX_LINES,
-            wrap="word",          # 가로 넘으면 자동 줄바꿈
+            wrap="word",
             relief="solid",
             borderwidth=1
         )
@@ -322,18 +333,18 @@ class KeywordDialog(tk.Toplevel):
         self.preview_text.configure(yscrollcommand=self.preview_scroll.set)
 
         # Description
-        ttk.Label(frm, text="Description (긴 설명, Info 팝업으로 표시)").grid(row=8, column=0, sticky="w")
+        ttk.Label(frm, text="Description (긴 설명, Info 팝업으로 표시)").grid(row=9, column=0, sticky="w")
         self.txt_desc = tk.Text(frm, height=10, wrap="word")
-        self.txt_desc.grid(row=9, column=0, sticky="nsew", pady=(2, 10))
+        self.txt_desc.grid(row=10, column=0, sticky="nsew", pady=(2, 10))
         self.txt_desc.insert("1.0", str(init.get("desc", "")))
 
         btns = ttk.Frame(frm)
-        btns.grid(row=10, column=0, sticky="e")
+        btns.grid(row=11, column=0, sticky="e")
         ttk.Button(btns, text="Cancel", command=self._cancel).pack(side=tk.LEFT, padx=6)
         ttk.Button(btns, text="OK", command=self._ok).pack(side=tk.LEFT)
 
         frm.columnconfigure(0, weight=1)
-        frm.rowconfigure(9, weight=1)
+        frm.rowconfigure(10, weight=1)
 
         # Build initial part rows
         initial_parts = keyword_parts_from_kw(init, self.delimiter)
@@ -343,7 +354,7 @@ class KeywordDialog(tk.Toplevel):
         for p in initial_parts:
             self._add_part_row(initial_text=p)
 
-        # populate import field with current joined (optional convenience)
+        # convenience: fill import box with current joined (optional)
         try:
             self.var_import_joined.set(self.delimiter.join([x for x in initial_parts if str(x).strip()]))
         except Exception:
@@ -357,6 +368,57 @@ class KeywordDialog(tk.Toplevel):
         ent_sum.focus_set()
         self.wait_window(self)
 
+    # ---------- Scroll helpers ----------
+    def _on_parts_container_configure(self, _event=None):
+        # Update scrollregion
+        try:
+            self.parts_canvas.configure(scrollregion=self.parts_canvas.bbox("all"))
+        except Exception:
+            pass
+
+    def _on_parts_canvas_configure(self, event=None):
+        # Make inner frame width match canvas width
+        try:
+            w = event.width if event else self.parts_canvas.winfo_width()
+            self.parts_canvas.itemconfigure(self._parts_window_id, width=w)
+        except Exception:
+            pass
+
+    def _bind_mousewheel(self, widget):
+        # Windows/Mac: <MouseWheel>, Linux: <Button-4/5>
+        widget.bind("<Enter>", lambda _e: self._activate_mousewheel(True))
+        widget.bind("<Leave>", lambda _e: self._activate_mousewheel(False))
+
+    def _activate_mousewheel(self, active: bool):
+        # bind on toplevel so wheel works even when cursor is over child widgets
+        if active:
+            self.bind_all("<MouseWheel>", self._on_mousewheel, add="+")
+            self.bind_all("<Button-4>", self._on_mousewheel_linux, add="+")
+            self.bind_all("<Button-5>", self._on_mousewheel_linux, add="+")
+        else:
+            try:
+                self.unbind_all("<MouseWheel>")
+                self.unbind_all("<Button-4>")
+                self.unbind_all("<Button-5>")
+            except Exception:
+                pass
+
+    def _on_mousewheel(self, event):
+        # Only scroll parts canvas when it can scroll
+        try:
+            self.parts_canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+        except Exception:
+            pass
+
+    def _on_mousewheel_linux(self, event):
+        try:
+            if event.num == 4:
+                self.parts_canvas.yview_scroll(-1, "units")
+            elif event.num == 5:
+                self.parts_canvas.yview_scroll(1, "units")
+        except Exception:
+            pass
+
     # ---------- Part rows ----------
     def _add_part_row(self, initial_text=""):
         row = ttk.Frame(self.parts_container)
@@ -367,22 +429,20 @@ class KeywordDialog(tk.Toplevel):
         if initial_text:
             ent.insert(0, str(initial_text))
 
-        # remove button (but keep at least one row)
         btn = ttk.Button(row, text="-", width=3, command=lambda r=row: self._remove_part_row(r))
         btn.pack(side=tk.LEFT, padx=(6, 0))
 
-        # update preview
         ent.bind("<KeyRelease>", lambda e, w=ent: self._on_part_entry_keyrelease(e, w))
-        # paste (offer split after paste completes)
         ent.bind("<Control-v>", lambda e, w=ent: self._after_paste_offer_split(w))
         ent.bind("<Control-V>", lambda e, w=ent: self._after_paste_offer_split(w))
 
+        # ensure scrollregion updates
+        self._on_parts_container_configure()
         self._update_preview()
 
     def _remove_part_row(self, row_frame):
         children = [w for w in self.parts_container.winfo_children() if isinstance(w, ttk.Frame)]
         if len(children) <= 1:
-            # keep at least one row; just clear
             try:
                 ent = row_frame.winfo_children()[0]
                 if isinstance(ent, ttk.Entry):
@@ -396,6 +456,8 @@ class KeywordDialog(tk.Toplevel):
             row_frame.destroy()
         except Exception:
             pass
+
+        self._on_parts_container_configure()
         self._update_preview()
 
     def _get_parts(self) -> list[str]:
@@ -419,14 +481,23 @@ class KeywordDialog(tk.Toplevel):
                 child.destroy()
             except Exception:
                 pass
+        self._on_parts_container_configure()
 
     def _set_parts_rows(self, parts: list[str]):
         self._clear_all_part_rows()
         if not parts:
-            parts = [""]  # 최소 1개 row 유지
+            parts = [""]  # keep at least one row
         for p in parts:
             self._add_part_row(initial_text=p)
+
+        self._on_parts_container_configure()
         self._update_preview()
+
+        # top of list for usability
+        try:
+            self.parts_canvas.yview_moveto(0.0)
+        except Exception:
+            pass
 
     # ---------- Preview ----------
     def _set_preview_text(self, text: str):
@@ -444,8 +515,6 @@ class KeywordDialog(tk.Toplevel):
         joined = self.delimiter.join(parts)
         self.var_join_preview.set(joined)
         self._set_preview_text(joined)
-        # import field은 사용자가 편하게 가져다 쓸 수 있게 동기화(단, 사용자가 직접 편집 중이면 방해될 수 있어 최소화)
-        # 여기서는 강제 동기화하지 않음.
 
     # ---------- Split / Import UX ----------
     def _split_by_delimiter(self, text: str) -> list[str]:
@@ -454,8 +523,7 @@ class KeywordDialog(tk.Toplevel):
         if delim == "":
             return []
         parts = [p.strip() for p in (text or "").split(delim)]
-        parts = [p for p in parts if p]
-        return parts
+        return [p for p in parts if p]
 
     def _confirm_apply_split(self, parts: list[str], source_label: str) -> bool:
         if not parts:
@@ -485,16 +553,13 @@ class KeywordDialog(tk.Toplevel):
         self._last_split_offer_text = raw
 
     def _after_paste_offer_split(self, entry_widget):
-        # paste는 이벤트 후 실제 텍스트가 들어오므로 after로 확인
         self.after(1, lambda: self._offer_split_from_part_entry(entry_widget))
 
-    def _on_part_entry_keyrelease(self, event, entry_widget):
+    def _on_part_entry_keyrelease(self, _event, entry_widget):
         self._update_preview()
-        # 키 입력으로 delimiter가 들어오는 경우도 있으므로, 조건 맞으면 확인 팝업 제공
         self._offer_split_from_part_entry(entry_widget)
 
     def _offer_split_from_part_entry(self, entry_widget):
-        # 중복 팝업/연쇄 팝업 방지
         if self._split_offer_inflight:
             return
 
@@ -514,17 +579,12 @@ class KeywordDialog(tk.Toplevel):
         if len(parts) <= 1:
             return
 
-        # 같은 텍스트로 반복 제안 방지
         if raw == self._last_split_offer_text:
             return
 
-        # “정말 joined string일 가능성”이 높을 때만 제안:
-        # - 현재 non-empty parts가 1개뿐이거나, 첫 번째 row에 입력된 경우 (대부분 joined paste)
         current_parts = self._get_parts()
         likely_joined = (len(current_parts) <= 1)
         if not likely_joined:
-            # 그래도 사용자 편의를 위해 제안은 가능하지만, 너무 공격적이면 불편할 수 있어 제한
-            # 여기서는 "현재 입력칸 문자열이 매우 길 때"만 제안
             if len(raw) < 30:
                 return
 
@@ -533,14 +593,13 @@ class KeywordDialog(tk.Toplevel):
             ok = self._confirm_apply_split(parts, source_label="Part 입력")
             if ok:
                 self._set_parts_rows(parts)
-                # Import 칸에도 넣어두면 다음 수정에 도움
                 try:
                     self.var_import_joined.set(self.delimiter.join(parts))
                 except Exception:
                     pass
                 self._last_split_offer_text = raw
             else:
-                self._last_split_offer_text = raw  # 거절해도 동일 텍스트 반복 팝업 방지
+                self._last_split_offer_text = raw
         finally:
             self._split_offer_inflight = False
 
