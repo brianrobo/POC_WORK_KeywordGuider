@@ -1,15 +1,15 @@
 # ============================================================
 # Keyword Guide UI POC
 # ------------------------------------------------------------
-# Version: 0.4.1 (2025-12-26)
+# Version: 0.4.2 (2025-12-26)
 #
-# Release Notes (v0.4.1)
-# - (FIX) Tree selection bug: selecting rows beyond the first sometimes didn't work.
-#   Root cause: on_keyword_select() called refresh_keywords() which rebuilds the tree and
-#   clears selection immediately. Now we do NOT rebuild the tree on selection changes.
-#   Instead, we update only preview column via refresh_keyword_previews_only().
+# Release Notes (v0.4.2)
+# - (UX) Keyword에 "Group" 필드 추가
+#   - KeywordDialog에 Group 입력란 추가 (Description과 별도)
+#   - Keyword List에 Summary 우측에 Group 컬럼 추가하여 표시
+# - (FIX 유지) Tree selection bug fix (선택 이벤트에서 tree rebuild 제거)
 #
-# Existing (v0.4.0 유지)
+# Existing (v0.4.1 유지)
 # - Keyword Description Rich Text 지원 (Bold + 3 Colors) with desc_rich runs 저장/로드
 # - Keyword List: 왼쪽(#0) 체크박스 + extended selection
 # - Select All / Clear All / Copy Selected(선택된 rendered들을 vendor delimiter로 join)
@@ -41,14 +41,15 @@ ISSUES_PATH = BASE_DIR / "issues_config.json"
 PLACEHOLDER_RE = re.compile(r"\{([A-Za-z0-9_]+)\}")
 DEFAULT_GEOMETRY = "1250x760"
 
-# Keyword list view: Summary | Info | Copy | Preview
-KEYWORD_COLS = ("summary", "info", "copy", "preview")
+# Keyword list view: Summary | Group | Info | Copy | Preview
+KEYWORD_COLS = ("summary", "group", "info", "copy", "preview")
 
 DEFAULT_KEYWORD_COL_WIDTHS = {
-    "summary": 260,
+    "summary": 240,
+    "group": 140,
     "info": 70,
     "copy": 70,
-    "preview": 700,
+    "preview": 650,
 }
 
 PARAM_COLS = ("pname", "pval")
@@ -182,36 +183,36 @@ def normalize_keywords(lst):
     """
     Normalize keyword list items to dict:
       legacy: {"summary":..., "desc":..., "text":...}
-      new:    {"summary":..., "desc":..., "desc_rich":[...], "parts":[...]}
+      new:    {"summary":..., "group":..., "desc":..., "desc_rich":[...], "parts":[...]}
     Backward compatible:
-      - string -> {"text": str, "summary":"", "desc":""}
+      - string -> {"text": str, "summary":"", "group":"", "desc":""}
       - {"text","desc"} / {"text","description"}
       - {"parts":[...]} -> keep parts (trim-only, allow duplicates)
+      - group optional; default ""
     """
     out = []
     for item in lst or []:
         if isinstance(item, str):
             t = item.strip()
             if t:
-                out.append({"text": t, "summary": "", "desc": ""})
+                out.append({"text": t, "summary": "", "group": "", "desc": ""})
             continue
 
         if not isinstance(item, dict):
             continue
 
         summary = str(item.get("summary", "")).strip()
+        group = str(item.get("group", "")).strip()
 
         desc_rich = item.get("desc_rich", None)
         desc = str(item.get("desc", item.get("description", ""))).strip()
-
-        if isinstance(desc_rich, list) and desc_rich:
-            if not desc:
-                desc = _desc_plain_from_rich(desc_rich).strip()
+        if isinstance(desc_rich, list) and desc_rich and not desc:
+            desc = _desc_plain_from_rich(desc_rich).strip()
 
         if "parts" in item and isinstance(item.get("parts"), list):
             parts = _clean_str_list_keep_order(item.get("parts"))
             if parts:
-                kw = {"parts": parts, "summary": summary, "desc": desc}
+                kw = {"parts": parts, "summary": summary, "group": group, "desc": desc}
                 if isinstance(desc_rich, list) and desc_rich:
                     kw["desc_rich"] = desc_rich
                 out.append(kw)
@@ -219,7 +220,7 @@ def normalize_keywords(lst):
 
         text = str(item.get("text", "")).strip()
         if text:
-            kw = {"text": text, "summary": summary, "desc": desc}
+            kw = {"text": text, "summary": summary, "group": group, "desc": desc}
             if isinstance(desc_rich, list) and desc_rich:
                 kw["desc_rich"] = desc_rich
             out.append(kw)
@@ -256,6 +257,9 @@ class KeywordDialog(tk.Toplevel):
     """
     Keyword input supports multiple parts via dynamic +/- rows.
 
+    Added:
+      - Group field
+
     Parts 영역:
       - 고정 height + vertical scroll (Canvas)
 
@@ -278,9 +282,10 @@ class KeywordDialog(tk.Toplevel):
         self.result = None
 
         self.delimiter = str(delimiter) if delimiter is not None else DEFAULT_DELIMITER
-        init = init or {"summary": "", "desc": ""}
+        init = init or {"summary": "", "group": "", "desc": ""}
 
         self.var_summary = tk.StringVar(value=str(init.get("summary", "")))
+        self.var_group = tk.StringVar(value=str(init.get("group", "")))
 
         self._last_split_offer_text = None
         self._split_offer_inflight = False
@@ -290,14 +295,18 @@ class KeywordDialog(tk.Toplevel):
 
         ttk.Label(frm, text="Summary (ListView에 표시될 짧은 요약)").grid(row=0, column=0, sticky="w")
         ent_sum = ttk.Entry(frm, textvariable=self.var_summary)
-        ent_sum.grid(row=1, column=0, sticky="ew", pady=(2, 10))
+        ent_sum.grid(row=1, column=0, sticky="ew", pady=(2, 8))
+
+        ttk.Label(frm, text="Group (ListView Summary 우측에 표시)").grid(row=2, column=0, sticky="w")
+        ent_grp = ttk.Entry(frm, textvariable=self.var_group)
+        ent_grp.grid(row=3, column=0, sticky="ew", pady=(2, 10))
 
         ttk.Label(frm, text=f"Import Joined String (delimiter: '{self.delimiter}')").grid(
-            row=2, column=0, sticky="w"
+            row=4, column=0, sticky="w"
         )
 
         import_row = ttk.Frame(frm)
-        import_row.grid(row=3, column=0, sticky="ew", pady=(2, 10))
+        import_row.grid(row=5, column=0, sticky="ew", pady=(2, 10))
         import_row.columnconfigure(0, weight=1)
 
         self.var_import_joined = tk.StringVar(value="")
@@ -308,10 +317,10 @@ class KeywordDialog(tk.Toplevel):
         )
         self.ent_import.bind("<Return>", lambda _e: self._import_joined_to_parts(ask_confirm=True))
 
-        ttk.Label(frm, text=f"Keyword Parts (구분자: '{self.delimiter}')").grid(row=4, column=0, sticky="w")
+        ttk.Label(frm, text=f"Keyword Parts (구분자: '{self.delimiter}')").grid(row=6, column=0, sticky="w")
 
         parts_outer = ttk.Frame(frm)
-        parts_outer.grid(row=5, column=0, sticky="ew", pady=(2, 6))
+        parts_outer.grid(row=7, column=0, sticky="ew", pady=(2, 6))
         parts_outer.columnconfigure(0, weight=1)
         parts_outer.rowconfigure(0, weight=1)
 
@@ -337,15 +346,15 @@ class KeywordDialog(tk.Toplevel):
         self._bind_mousewheel(self.parts_container)
 
         add_btn_row = ttk.Frame(frm)
-        add_btn_row.grid(row=6, column=0, sticky="w", pady=(0, 8))
+        add_btn_row.grid(row=8, column=0, sticky="w", pady=(0, 8))
         ttk.Button(add_btn_row, text="+ Add Part", command=self._add_part_row).pack(side=tk.LEFT)
 
         ttk.Label(frm, text="Joined Keyword Preview (auto wrap, scrollable)").grid(
-            row=7, column=0, sticky="w", pady=(6, 0)
+            row=9, column=0, sticky="w", pady=(6, 0)
         )
 
         preview_box = ttk.Frame(frm)
-        preview_box.grid(row=8, column=0, sticky="ew", pady=(2, 10))
+        preview_box.grid(row=10, column=0, sticky="ew", pady=(2, 10))
         preview_box.columnconfigure(0, weight=1)
 
         self.preview_text = tk.Text(
@@ -363,9 +372,9 @@ class KeywordDialog(tk.Toplevel):
         self.preview_text.configure(yscrollcommand=self.preview_scroll.set)
 
         # ---- Description toolbar (rich text) ----
-        ttk.Label(frm, text="Description (Bold + Color, Info 팝업으로 표시)").grid(row=9, column=0, sticky="w")
+        ttk.Label(frm, text="Description (Bold + Color, Info 팝업으로 표시)").grid(row=11, column=0, sticky="w")
         desc_toolbar = ttk.Frame(frm)
-        desc_toolbar.grid(row=10, column=0, sticky="w", pady=(4, 2))
+        desc_toolbar.grid(row=12, column=0, sticky="w", pady=(4, 2))
 
         ttk.Button(desc_toolbar, text="B", width=3, command=self._toggle_bold).pack(side=tk.LEFT, padx=(0, 8))
         ttk.Button(desc_toolbar, text="Black", command=lambda: self._apply_color("black")).pack(side=tk.LEFT, padx=2)
@@ -373,7 +382,7 @@ class KeywordDialog(tk.Toplevel):
         ttk.Button(desc_toolbar, text="Blue", command=lambda: self._apply_color("blue")).pack(side=tk.LEFT, padx=2)
 
         self.txt_desc = tk.Text(frm, height=10, wrap="word")
-        self.txt_desc.grid(row=11, column=0, sticky="nsew", pady=(2, 10))
+        self.txt_desc.grid(row=13, column=0, sticky="nsew", pady=(2, 10))
 
         # tags
         self.txt_desc.tag_configure("b", font=("TkDefaultFont", 9, "bold"))
@@ -382,12 +391,12 @@ class KeywordDialog(tk.Toplevel):
         self.txt_desc.tag_configure("c_blue", foreground="blue")
 
         btns = ttk.Frame(frm)
-        btns.grid(row=12, column=0, sticky="e")
+        btns.grid(row=14, column=0, sticky="e")
         ttk.Button(btns, text="Cancel", command=self._cancel).pack(side=tk.LEFT, padx=6)
         ttk.Button(btns, text="OK", command=self._ok).pack(side=tk.LEFT)
 
         frm.columnconfigure(0, weight=1)
-        frm.rowconfigure(11, weight=1)
+        frm.rowconfigure(13, weight=1)
 
         # Build initial part rows
         initial_parts = keyword_parts_from_kw(init, self.delimiter)
@@ -753,6 +762,7 @@ class KeywordDialog(tk.Toplevel):
         self.result = {
             "parts": parts,
             "summary": self.var_summary.get().strip(),
+            "group": self.var_group.get().strip(),
             "desc": desc_plain,          # legacy 유지
             "desc_rich": desc_rich,      # 신규 rich
         }
@@ -767,26 +777,29 @@ class KeywordDialog(tk.Toplevel):
 # Info Popup
 # ------------------------------------------------------------
 class InfoPopup(tk.Toplevel):
-    def __init__(self, parent, title: str, summary: str, keyword: str, desc: str, desc_rich=None):
+    def __init__(self, parent, title: str, summary: str, group: str, keyword: str, desc: str, desc_rich=None):
         super().__init__(parent)
         self.title(title)
-        self.geometry("820x480")
+        self.geometry("840x520")
 
         frm = ttk.Frame(self, padding=12)
         frm.pack(fill=tk.BOTH, expand=True)
 
         ttk.Label(frm, text="Summary").grid(row=0, column=0, sticky="w")
-        ttk.Label(frm, text=summary or "(empty)").grid(row=1, column=0, sticky="w", pady=(0, 10))
+        ttk.Label(frm, text=summary or "(empty)").grid(row=1, column=0, sticky="w", pady=(0, 8))
 
-        ttk.Label(frm, text="Keyword").grid(row=2, column=0, sticky="w")
+        ttk.Label(frm, text="Group").grid(row=2, column=0, sticky="w")
+        ttk.Label(frm, text=group or "(empty)").grid(row=3, column=0, sticky="w", pady=(0, 10))
+
+        ttk.Label(frm, text="Keyword").grid(row=4, column=0, sticky="w")
         txt_kw = tk.Text(frm, wrap="word", height=4)
-        txt_kw.grid(row=3, column=0, sticky="nsew", pady=(0, 10))
+        txt_kw.grid(row=5, column=0, sticky="nsew", pady=(0, 10))
         txt_kw.insert("1.0", keyword or "")
         txt_kw.configure(state="disabled")
 
-        ttk.Label(frm, text="Description").grid(row=4, column=0, sticky="w")
+        ttk.Label(frm, text="Description").grid(row=6, column=0, sticky="w")
         txt = tk.Text(frm, wrap="word")
-        txt.grid(row=5, column=0, sticky="nsew")
+        txt.grid(row=7, column=0, sticky="nsew")
 
         txt.tag_configure("b", font=("TkDefaultFont", 9, "bold"))
         txt.tag_configure("c_black", foreground="black")
@@ -814,11 +827,11 @@ class InfoPopup(tk.Toplevel):
         txt.configure(state="disabled")
 
         btns = ttk.Frame(frm)
-        btns.grid(row=6, column=0, sticky="e", pady=(10, 0))
+        btns.grid(row=8, column=0, sticky="e", pady=(10, 0))
         ttk.Button(btns, text="Close", command=self.destroy).pack()
 
         frm.columnconfigure(0, weight=1)
-        frm.rowconfigure(5, weight=1)
+        frm.rowconfigure(7, weight=1)
 
         self.transient(parent)
         self.grab_set()
@@ -1078,7 +1091,7 @@ class KeywordGuideApp(tk.Tk):
         right = ttk.Frame(root)
         right.grid(row=0, column=1, sticky="nsew", padx=(12, 0))
 
-        ttk.Label(right, text="Keywords: [ ] / Summary / Info / Copy / Preview(Rendered)").grid(
+        ttk.Label(right, text="Keywords: [ ] / Summary / Group / Info / Copy / Preview(Rendered)").grid(
             row=0, column=0, sticky="w"
         )
 
@@ -1093,11 +1106,18 @@ class KeywordGuideApp(tk.Tk):
         self.tree.heading("#0", text="")
         self.tree.column("#0", width=34, anchor="center", stretch=False)
 
-        headings = {"summary": "Summary", "info": "Info", "copy": "Copy", "preview": "Preview"}
+        headings = {
+            "summary": "Summary",
+            "group": "Group",
+            "info": "Info",
+            "copy": "Copy",
+            "preview": "Preview",
+        }
         for c in KEYWORD_COLS:
             self.tree.heading(c, text=headings.get(c, c))
 
         self.tree.column("summary", width=DEFAULT_KEYWORD_COL_WIDTHS["summary"], anchor="w", stretch=False)
+        self.tree.column("group", width=DEFAULT_KEYWORD_COL_WIDTHS["group"], anchor="w", stretch=False)
         self.tree.column("info", width=DEFAULT_KEYWORD_COL_WIDTHS["info"], anchor="center", stretch=False)
         self.tree.column("copy", width=DEFAULT_KEYWORD_COL_WIDTHS["copy"], anchor="center", stretch=False)
         self.tree.column("preview", width=DEFAULT_KEYWORD_COL_WIDTHS["preview"], anchor="w", stretch=True)
@@ -1285,10 +1305,11 @@ class KeywordGuideApp(tk.Tk):
         for idx, kw in enumerate(obj["_keywords"]):
             raw_joined = keyword_joined_template(kw, delim)
             summary = kw.get("summary", "")
+            group = kw.get("group", "")
             preview = render_keyword(raw_joined, params)
 
             iid = str(idx)
-            self.tree.insert("", "end", iid=iid, text="", values=(summary, "Info", "Copy", preview))
+            self.tree.insert("", "end", iid=iid, text="", values=(summary, group, "Info", "Copy", preview))
             self._set_checkbox_for_iid(iid, checked=False)
 
         self._sync_checkboxes_with_selection()
@@ -1472,7 +1493,12 @@ class KeywordGuideApp(tk.Tk):
     def add_keyword(self):
         v = self.vendor_var.get()
         delim = self._get_vendor_delimiter(v)
-        dlg = KeywordDialog(self, "Add Keyword", init={"parts": [""], "summary": "", "desc": ""}, delimiter=delim)
+        dlg = KeywordDialog(
+            self,
+            "Add Keyword",
+            init={"parts": [""], "summary": "", "group": "", "desc": ""},
+            delimiter=delim,
+        )
         if dlg.result:
             obj = self._current_obj()
             obj["_keywords"].append(dlg.result)
@@ -1591,17 +1617,18 @@ class KeywordGuideApp(tk.Tk):
         delim = self._get_vendor_delimiter(v)
         raw_joined = keyword_joined_template(kw, delim)
 
-        # columns: #0 checkbox, #1 summary, #2 info, #3 copy, #4 preview
-        if col == "#2":  # Info
+        # columns: #0 checkbox, #1 summary, #2 group, #3 info, #4 copy, #5 preview
+        if col == "#3":  # Info
             InfoPopup(
                 self,
                 title="Keyword Description",
                 summary=kw.get("summary", ""),
+                group=kw.get("group", ""),
                 keyword=raw_joined,
                 desc=kw.get("desc", ""),
                 desc_rich=kw.get("desc_rich", None),
             )
-        elif col == "#3":  # Copy
+        elif col == "#4":  # Copy
             rendered = render_keyword(raw_joined, params)
             self.clipboard_clear()
             self.clipboard_append(rendered)
@@ -1610,7 +1637,7 @@ class KeywordGuideApp(tk.Tk):
 
     def on_tree_double_click(self, event):
         col = self.tree.identify_column(event.x)
-        if col in ("#0", "#2", "#3"):
+        if col in ("#0", "#3", "#4"):
             return
         self.edit_keyword()
 
@@ -1623,7 +1650,8 @@ class KeywordGuideApp(tk.Tk):
         try:
             vals = list(self.tree.item(row_iid, "values"))
             if len(vals) == len(KEYWORD_COLS):
-                vals[2] = "Copied"
+                # copy column index = 3 in KEYWORD_COLS ("summary","group","info","copy","preview")
+                vals[3] = "Copied"
                 self.tree.item(row_iid, values=tuple(vals))
         except Exception:
             pass
@@ -1659,7 +1687,7 @@ class KeywordGuideApp(tk.Tk):
         try:
             vals = list(self.tree.item(row_iid, "values"))
             if len(vals) == len(KEYWORD_COLS):
-                vals[2] = "Copy"
+                vals[3] = "Copy"
                 self.tree.item(row_iid, values=tuple(vals))
         except Exception:
             pass
