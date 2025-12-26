@@ -1,21 +1,20 @@
 # ============================================================
 # Keyword Guide UI POC
 # ------------------------------------------------------------
-# Version: 0.3.8 (2025-12-26)
+# Version: 0.3.9 (2025-12-26)
 #
-# Release Notes (v0.3.8)
-# 1) Keyword List: Up/Down 버튼 추가 (단일 선택 기준으로만 순서 변경)
-#    - obj["_keywords"] 리스트에서 swap 후 즉시 저장 + refresh
-#    - 이동 후 해당 항목 selection 유지(see 포함)
+# Release Notes (v0.3.9)
+# 1) Keyword List: 왼쪽(#0) 체크박스 표시 추가 (selection과 동기화)
+#    - 체크박스 클릭으로 selection 토글 (multi-select 유지)
+# 2) Select All / Clear All 버튼 추가
+# 3) Copy Selected: "체크된 항목(=selection)"들을 delimiter로 join하여 copy
 #
-# Existing (v0.3.7 유지)
+# Existing (v0.3.8 유지)
 # - Keyword List View 컬럼: Summary | Info | Copy | Preview
-# - Keyword List: multi-select(extended) 지원
-# - Copy Selected: 선택된 keyword들을 vendor delimiter로 join하여 한 번에 copy (버튼 + Ctrl+C)
-# - KeywordDialog: Parts 영역 고정 높이 + 스크롤 (행 많아도 창 height 폭증 방지)
-# - Preview: wrap + 고정 lines + 스크롤
+# - Up/Down 버튼: 단일 선택(첫 선택) 기준 swap + 저장
+# - KeywordDialog: Parts 고정 높이 + 스크롤, Preview wrap+스크롤
 # - Import Joined String split: 확인 후 적용
-# - Part 입력 중 delimiter 포함 시: 확인 후 split 제안(자동 아님)
+# - Part 입력 중 delimiter 포함 시 split 제안: 확인 후 적용(자동 아님)
 # ============================================================
 
 import json
@@ -236,7 +235,6 @@ class KeywordDialog(tk.Toplevel):
         init = init or {"summary": "", "desc": ""}
 
         self.var_summary = tk.StringVar(value=str(init.get("summary", "")))
-        self.var_join_preview = tk.StringVar(value="")
 
         self._last_split_offer_text = None
         self._split_offer_inflight = False
@@ -343,7 +341,7 @@ class KeywordDialog(tk.Toplevel):
         except Exception:
             pass
 
-        self._update_preview()
+        self._set_preview_text(self.delimiter.join(self._get_parts()))
 
         self.transient(parent)
         self.grab_set()
@@ -483,9 +481,7 @@ class KeywordDialog(tk.Toplevel):
             pass
 
     def _update_preview(self):
-        parts = self._get_parts()
-        joined = self.delimiter.join(parts)
-        self.var_join_preview.set(joined)
+        joined = self.delimiter.join(self._get_parts())
         self._set_preview_text(joined)
 
     def _split_by_delimiter(self, text: str) -> list[str]:
@@ -555,9 +551,8 @@ class KeywordDialog(tk.Toplevel):
 
         current_parts = self._get_parts()
         likely_joined = (len(current_parts) <= 1)
-        if not likely_joined:
-            if len(raw) < 30:
-                return
+        if not likely_joined and len(raw) < 30:
+            return
 
         self._split_offer_inflight = True
         try:
@@ -665,10 +660,55 @@ class KeywordGuideApp(tk.Tk):
 
         self.geometry(self.ui_state.get("geometry", DEFAULT_GEOMETRY))
         self._build_ui()
+        self._make_checkbox_images()
+
         self._apply_saved_widths()
         self._init_vendor()
         self._ensure_current_obj_migrated()
         self.protocol("WM_DELETE_WINDOW", self.on_close)
+
+    # --------------------------------------------------------
+    # Checkbox Images + Sync
+    # --------------------------------------------------------
+    def _make_checkbox_images(self):
+        def make_img(checked: bool):
+            img = tk.PhotoImage(width=12, height=12)
+            img.put("white", to=(0, 0, 12, 12))
+            for x in range(12):
+                img.put("black", (x, 0))
+                img.put("black", (x, 11))
+            for y in range(12):
+                img.put("black", (0, y))
+                img.put("black", (11, y))
+            if checked:
+                pts = [(3, 6), (4, 7), (5, 8), (6, 7), (7, 6), (8, 5)]
+                for (x, y) in pts:
+                    img.put("black", (x, y))
+                    if x + 1 < 12:
+                        img.put("black", (x + 1, y))
+            return img
+
+        self._img_cb_off = make_img(False)
+        self._img_cb_on = make_img(True)
+
+    def _set_checkbox_for_iid(self, iid: str, checked: bool):
+        try:
+            self.tree.item(iid, image=(self._img_cb_on if checked else self._img_cb_off))
+        except Exception:
+            pass
+
+    def _sync_checkboxes_with_selection(self):
+        sel = set(self.tree.selection())
+        for iid in self.tree.get_children(""):
+            self._set_checkbox_for_iid(iid, iid in sel)
+
+    def _toggle_checkbox_row(self, iid: str):
+        sel = set(self.tree.selection())
+        if iid in sel:
+            self.tree.selection_remove(iid)
+        else:
+            self.tree.selection_add(iid)
+        self._sync_checkboxes_with_selection()
 
     # --------------------------------------------------------
     # Defaults
@@ -839,10 +879,22 @@ class KeywordGuideApp(tk.Tk):
         right = ttk.Frame(root)
         right.grid(row=0, column=1, sticky="nsew", padx=(12, 0))
 
-        ttk.Label(right, text="Keywords: Summary / Info / Copy / Preview(Rendered)").grid(row=0, column=0, sticky="w")
+        ttk.Label(right, text="Keywords: [ ] / Summary / Info / Copy / Preview(Rendered)").grid(
+            row=0, column=0, sticky="w"
+        )
 
-        # multi-select enabled here (Copy Selected용). Up/Down은 단일 선택(첫번째 선택)만 사용.
-        self.tree = ttk.Treeview(right, columns=KEYWORD_COLS, show="headings", height=13, selectmode="extended")
+        # show="tree headings" to expose #0 (checkbox)
+        self.tree = ttk.Treeview(
+            right,
+            columns=KEYWORD_COLS,
+            show="tree headings",
+            height=13,
+            selectmode="extended",
+        )
+
+        # checkbox column (#0)
+        self.tree.heading("#0", text="")
+        self.tree.column("#0", width=34, anchor="center", stretch=False)
 
         headings = {
             "summary": "Summary",
@@ -885,6 +937,11 @@ class KeywordGuideApp(tk.Tk):
 
         ttk.Button(btns, text="Up", command=self.move_keyword_up).pack(side=tk.LEFT, padx=4)
         ttk.Button(btns, text="Down", command=self.move_keyword_down).pack(side=tk.LEFT, padx=4)
+
+        ttk.Separator(btns, orient="vertical").pack(side=tk.LEFT, fill=tk.Y, padx=10)
+
+        ttk.Button(btns, text="Select All", command=self.select_all_keywords).pack(side=tk.LEFT, padx=4)
+        ttk.Button(btns, text="Clear All", command=self.clear_all_keywords_selection).pack(side=tk.LEFT, padx=4)
 
         ttk.Separator(btns, orient="vertical").pack(side=tk.LEFT, fill=tk.Y, padx=10)
 
@@ -1039,7 +1096,12 @@ class KeywordGuideApp(tk.Tk):
             raw_joined = keyword_joined_template(kw, delim)
             summary = kw.get("summary", "")
             preview = render_keyword(raw_joined, params)
-            self.tree.insert("", "end", iid=str(idx), values=(summary, "Info", "Copy", preview))
+
+            iid = str(idx)
+            self.tree.insert("", "end", iid=iid, text="", values=(summary, "Info", "Copy", preview))
+            self._set_checkbox_for_iid(iid, checked=False)
+
+        self._sync_checkboxes_with_selection()
 
         v, i, d = self.vendor_var.get(), self.issue_var.get(), self.detail_var.get()
         self.status_var.set(f"Selected: {v} > {i} > {d}")
@@ -1061,6 +1123,8 @@ class KeywordGuideApp(tk.Tk):
         )
 
     def on_keyword_select(self, *_):
+        self._sync_checkboxes_with_selection()
+
         for w in self.inline_box.winfo_children():
             w.destroy()
 
@@ -1069,7 +1133,6 @@ class KeywordGuideApp(tk.Tk):
             self.clear_inline()
             return
 
-        # multi-select 중 inline은 첫 선택 기준
         try:
             idx = int(sel[0])
         except Exception:
@@ -1116,6 +1179,22 @@ class KeywordGuideApp(tk.Tk):
         self._persist_db(f"Param updated: {key}={value}")
         self.refresh_keywords()
         self.refresh_params()
+
+    # --------------------------------------------------------
+    # Select All / Clear All
+    # --------------------------------------------------------
+    def select_all_keywords(self):
+        kids = self.tree.get_children("")
+        if not kids:
+            return
+        self.tree.selection_set(kids)
+        self._sync_checkboxes_with_selection()
+        self.status_var.set(f"Selected all ({len(kids)})")
+
+    def clear_all_keywords_selection(self):
+        self.tree.selection_remove(self.tree.selection())
+        self._sync_checkboxes_with_selection()
+        self.status_var.set("Cleared all selections")
 
     # --------------------------------------------------------
     # Bulk copy selected keywords (Rendered, vendor delimiter join)
@@ -1273,6 +1352,11 @@ class KeywordGuideApp(tk.Tk):
         if not row:
             return
 
+        # checkbox column (#0)
+        if col == "#0":
+            self._toggle_checkbox_row(row)
+            return "break"
+
         idx = int(row)
         obj = self._current_obj()
         params = obj["_params"]
@@ -1282,7 +1366,7 @@ class KeywordGuideApp(tk.Tk):
         delim = self._get_vendor_delimiter(v)
         raw_joined = keyword_joined_template(kw, delim)
 
-        # columns: #1 summary, #2 info, #3 copy, #4 preview
+        # columns: #0 checkbox, #1 summary, #2 info, #3 copy, #4 preview
         if col == "#2":  # Info
             InfoPopup(
                 self,
@@ -1300,7 +1384,7 @@ class KeywordGuideApp(tk.Tk):
 
     def on_tree_double_click(self, event):
         col = self.tree.identify_column(event.x)
-        if col in ("#2", "#3"):
+        if col in ("#0", "#2", "#3"):
             return
         self.edit_keyword()
 
@@ -1636,6 +1720,13 @@ class KeywordGuideApp(tk.Tk):
                 except Exception:
                     pass
 
+        # (#0 checkbox column width)
+        try:
+            w0 = self.ui_state.get("keyword_tree_col0_width", 34)
+            self.tree.column("#0", width=int(w0))
+        except Exception:
+            pass
+
         pcols = self.ui_state.get("param_tree_cols", {})
         for c, w in pcols.items():
             if c in DEFAULT_PARAM_COL_WIDTHS:
@@ -1649,6 +1740,10 @@ class KeywordGuideApp(tk.Tk):
         for c, w in DEFAULT_KEYWORD_COL_WIDTHS.items():
             if c in KEYWORD_COLS:
                 self.tree.column(c, width=w)
+        try:
+            self.tree.column("#0", width=34)
+        except Exception:
+            pass
         for c, w in DEFAULT_PARAM_COL_WIDTHS.items():
             self.param_tree.column(c, width=w)
         self.status_var.set("UI layout reset to defaults.")
@@ -1656,6 +1751,7 @@ class KeywordGuideApp(tk.Tk):
     def on_close(self):
         state = {
             "geometry": self.geometry(),
+            "keyword_tree_col0_width": self.tree.column("#0", "width"),
             "keyword_tree_cols": {c: self.tree.column(c, "width") for c in KEYWORD_COLS},
             "param_tree_cols": {c: self.param_tree.column(c, "width") for c in DEFAULT_PARAM_COL_WIDTHS},
         }
