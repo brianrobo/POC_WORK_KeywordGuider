@@ -1,26 +1,20 @@
 # ============================================================
 # Keyword Guide UI POC
 # ------------------------------------------------------------
-# Version: 0.3.6 (2025-12-26)
+# Version: 0.3.7 (2025-12-26)
 #
-# Release Notes (v0.3.6)
-# 1) Keyword List View 컬럼 단순화
-#    - 기존(v0.3.5): Summary | Info | Copy | Keyword | Preview
-#    - 변경(v0.3.6): Summary | Info | Copy | Preview
-#    - 목적: 리스트 뷰에서 핵심 UX만 노출(가로 잘림 최소화)
+# Release Notes (v0.3.7)
+# 1) Keyword List: 다중 선택(extended) 지원
+# 2) 선택된 여러 Keyword를 Vendor delimiter로 연결하여 한 번에 Copy
+#    - 버튼: "Copy Selected"
+#    - 단축키: Ctrl+C
 #
-# 2) v0.3.5 기능 유지
-#    - KeywordDialog: Parts 영역 고정 높이 + 스크롤 (창 height 폭증 방지)
-#    - Preview: wrap + 고정 lines + 스크롤
-#    - Import Joined String split: 확인 후 적용
-#    - Part 입력 중 delimiter 포함 시: 확인 후 split 제안(자동 아님)
-#
-# Existing Features (유지)
-# - Vendor별 Issue 관리 + Vendor별 Delimiter 저장
-# - Keyword CRUD / Preview / Copy (Copied bold highlight)
-# - Placeholder detect + Inline Apply (category-level params)
-# - Category-level params in-place edit (Enter/Esc)
-# - UI state persistence
+# Existing (v0.3.6 유지)
+# - Keyword List View 컬럼: Summary | Info | Copy | Preview
+# - KeywordDialog: Parts 영역 고정 높이 + 스크롤
+# - Preview: wrap + 고정 lines + 스크롤
+# - Import Joined String split: 확인 후 적용
+# - Part 입력 중 delimiter 포함 시: 확인 후 split 제안(자동 아님)
 # ============================================================
 
 import json
@@ -847,7 +841,8 @@ class KeywordGuideApp(tk.Tk):
 
         ttk.Label(right, text="Keywords: Summary / Info / Copy / Preview(Rendered)").grid(row=0, column=0, sticky="w")
 
-        self.tree = ttk.Treeview(right, columns=KEYWORD_COLS, show="headings", height=13)
+        # IMPORTANT: multi-select enabled here
+        self.tree = ttk.Treeview(right, columns=KEYWORD_COLS, show="headings", height=13, selectmode="extended")
 
         headings = {
             "summary": "Summary",
@@ -877,11 +872,20 @@ class KeywordGuideApp(tk.Tk):
         self.tree.bind("<Double-1>", self.on_tree_double_click)
         self.tree.bind("<<TreeviewSelect>>", self.on_keyword_select)
 
+        # Bulk copy shortcut
+        self.tree.bind("<Control-c>", self.copy_selected_keywords)
+        self.tree.bind("<Control-C>", self.copy_selected_keywords)
+
         btns = ttk.Frame(right)
         btns.grid(row=2, column=0, sticky="e", pady=8)
+
         ttk.Button(btns, text="Add", command=self.add_keyword).pack(side=tk.LEFT, padx=4)
         ttk.Button(btns, text="Edit", command=self.edit_keyword).pack(side=tk.LEFT, padx=4)
         ttk.Button(btns, text="Remove", command=self.remove_keyword).pack(side=tk.LEFT, padx=4)
+
+        ttk.Separator(btns, orient="vertical").pack(side=tk.LEFT, fill=tk.Y, padx=10)
+
+        ttk.Button(btns, text="Copy Selected", command=self.copy_selected_keywords).pack(side=tk.LEFT, padx=4)
         ttk.Button(btns, text="Reset UI Layout", command=self.reset_ui_layout).pack(side=tk.LEFT, padx=12)
 
         self.inline_box = ttk.LabelFrame(right, text="Inline Parameters (selected keyword placeholders)")
@@ -1032,8 +1036,6 @@ class KeywordGuideApp(tk.Tk):
             raw_joined = keyword_joined_template(kw, delim)
             summary = kw.get("summary", "")
             preview = render_keyword(raw_joined, params)
-
-            # list view: summary, info, copy, preview
             self.tree.insert("", "end", iid=str(idx), values=(summary, "Info", "Copy", preview))
 
         v, i, d = self.vendor_var.get(), self.issue_var.get(), self.detail_var.get()
@@ -1064,7 +1066,13 @@ class KeywordGuideApp(tk.Tk):
             self.clear_inline()
             return
 
-        idx = int(sel[0])
+        # multi-select 중, inline은 "첫번째 선택" 기준으로 표시
+        try:
+            idx = int(sel[0])
+        except Exception:
+            self.clear_inline()
+            return
+
         obj = self._current_obj()
         kw = obj["_keywords"][idx]
 
@@ -1105,6 +1113,49 @@ class KeywordGuideApp(tk.Tk):
         self._persist_db(f"Param updated: {key}={value}")
         self.refresh_keywords()
         self.refresh_params()
+
+    # --------------------------------------------------------
+    # NEW: Bulk copy selected keywords
+    # --------------------------------------------------------
+    def copy_selected_keywords(self, _event=None):
+        sel = list(self.tree.selection())
+        if not sel:
+            self.status_var.set("No selection to copy.")
+            return
+
+        # keep visual order (iid is index-string)
+        try:
+            sel_sorted = sorted(sel, key=lambda x: int(x))
+        except Exception:
+            sel_sorted = sel
+
+        obj = self._current_obj()
+        params = obj["_params"]
+        v = self.vendor_var.get()
+        delim = self._get_vendor_delimiter(v)
+
+        rendered_list = []
+        for iid in sel_sorted:
+            try:
+                idx = int(iid)
+            except Exception:
+                continue
+            if idx < 0 or idx >= len(obj["_keywords"]):
+                continue
+            kw = obj["_keywords"][idx]
+            raw_joined = keyword_joined_template(kw, delim)
+            rendered = render_keyword(raw_joined, params).strip()
+            if rendered:
+                rendered_list.append(rendered)
+
+        if not rendered_list:
+            self.status_var.set("No valid keywords to copy.")
+            return
+
+        combined = delim.join(rendered_list)
+        self.clipboard_clear()
+        self.clipboard_append(combined)
+        self.status_var.set(f"Copied Selected ({len(rendered_list)}): {combined}")
 
     # --------------------------------------------------------
     # Keyword CRUD
@@ -1190,7 +1241,7 @@ class KeywordGuideApp(tk.Tk):
 
     def on_tree_double_click(self, event):
         col = self.tree.identify_column(event.x)
-        if col in ("#2", "#3"):  # Info/Copy는 더블클릭 edit 방지
+        if col in ("#2", "#3"):
             return
         self.edit_keyword()
 
@@ -1203,7 +1254,6 @@ class KeywordGuideApp(tk.Tk):
         try:
             vals = list(self.tree.item(row_iid, "values"))
             if len(vals) == len(KEYWORD_COLS):
-                # copy 컬럼 index=2 (0-based): (summary, info, copy, preview)
                 vals[2] = "Copied"
                 self.tree.item(row_iid, values=tuple(vals))
         except Exception:
@@ -1521,7 +1571,6 @@ class KeywordGuideApp(tk.Tk):
     def _apply_saved_widths(self):
         cols = self.ui_state.get("keyword_tree_cols", {})
         for c, w in cols.items():
-            # 과거 state에 keyword 컬럼이 있어도 무시되도록 현재 컬럼만 반영
             if c in DEFAULT_KEYWORD_COL_WIDTHS and c in KEYWORD_COLS:
                 try:
                     self.tree.column(c, width=int(w))
