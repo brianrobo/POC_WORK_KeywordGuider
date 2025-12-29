@@ -1,15 +1,17 @@
 # ============================================================
 # Keyword Guide UI POC
 # ------------------------------------------------------------
-# Version: 0.4.2 (2025-12-26)
+# Version: 0.4.3 (2025-12-29)
 #
-# Release Notes (v0.4.2)
-# - (UX) Keyword에 "Group" 필드 추가
-#   - KeywordDialog에 Group 입력란 추가 (Description과 별도)
-#   - Keyword List에 Summary 우측에 Group 컬럼 추가하여 표시
-# - (FIX 유지) Tree selection bug fix (선택 이벤트에서 tree rebuild 제거)
+# Release Notes (v0.4.3)
+# - (UX) Window title에 release version 표시
+# - (UX) Copy 시 파라미터 미적용 옵션 추가 (Copy w/o params)
+#        - {CH} 같은 placeholder는 빈 값으로 치환하여 복사
+#        - 단일 Copy / Copy Selected 모두 동일 옵션 적용
 #
-# Existing (v0.4.1 유지)
+# Existing (v0.4.2 유지)
+# - Keyword에 "Group" 필드 추가
+# - Tree selection bug fix (선택 이벤트에서 tree rebuild 제거)
 # - Keyword Description Rich Text 지원 (Bold + 3 Colors) with desc_rich runs 저장/로드
 # - Keyword List: 왼쪽(#0) 체크박스 + extended selection
 # - Select All / Clear All / Copy Selected(선택된 rendered들을 vendor delimiter로 join)
@@ -29,6 +31,11 @@ import re
 from pathlib import Path
 import tkinter as tk
 from tkinter import ttk, messagebox, simpledialog
+
+# ------------------------------------------------------------
+# App Version
+# ------------------------------------------------------------
+APP_VERSION = "0.4.3"
 
 # ------------------------------------------------------------
 # Paths / Constants
@@ -99,6 +106,14 @@ def render_keyword(template: str, params: dict):
     for k, v in params.items():
         out = out.replace("{" + str(k) + "}", str(v))
     return out
+
+
+def strip_placeholders(template: str) -> str:
+    """
+    Replace all placeholders like {CH}, {ABC} with empty string.
+    Example: "FreeAck;CH:{CH};" -> "FreeAck;CH:;"
+    """
+    return PLACEHOLDER_RE.sub("", template or "")
 
 
 def default_issues():
@@ -844,7 +859,7 @@ class InfoPopup(tk.Toplevel):
 class KeywordGuideApp(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("Chipset Log Keyword Guide")
+        self.title(f"Chipset Log Keyword Guide v{APP_VERSION}")
 
         self.db = load_json(DB_PATH) or self._default_db()
         self.ui_state = load_json(UI_STATE_PATH)
@@ -863,6 +878,9 @@ class KeywordGuideApp(tk.Tk):
         self.detail_var = tk.StringVar()
         self.status_var = tk.StringVar(value="Ready")
         self.delim_var = tk.StringVar(value=DEFAULT_DELIMITER)
+
+        # Copy mode
+        self.copy_wo_params_var = tk.BooleanVar(value=False)
 
         self._param_editor = None
         self._param_editing = None
@@ -1156,6 +1174,12 @@ class KeywordGuideApp(tk.Tk):
         ttk.Separator(btns, orient="vertical").pack(side=tk.LEFT, fill=tk.Y, padx=10)
 
         ttk.Button(btns, text="Copy Selected", command=self.copy_selected_keywords).pack(side=tk.LEFT, padx=4)
+
+        # NEW: copy w/o params toggle
+        ttk.Checkbutton(btns, text="Copy w/o params", variable=self.copy_wo_params_var).pack(
+            side=tk.LEFT, padx=(10, 4)
+        )
+
         ttk.Button(btns, text="Reset UI Layout", command=self.reset_ui_layout).pack(side=tk.LEFT, padx=12)
 
         self.inline_box = ttk.LabelFrame(right, text="Inline Parameters (selected keyword placeholders)")
@@ -1306,6 +1330,8 @@ class KeywordGuideApp(tk.Tk):
             raw_joined = keyword_joined_template(kw, delim)
             summary = kw.get("summary", "")
             group = kw.get("group", "")
+
+            # Preview는 항상 rendered (기존 유지)
             preview = render_keyword(raw_joined, params)
 
             iid = str(idx)
@@ -1437,8 +1463,18 @@ class KeywordGuideApp(tk.Tk):
         self.status_var.set("Cleared all selections")
 
     # --------------------------------------------------------
-    # Bulk copy selected keywords (Rendered, vendor delimiter join)
+    # Bulk copy selected keywords
     # --------------------------------------------------------
+    def _render_for_copy(self, raw_joined: str, params: dict) -> str:
+        """
+        Copy output generator.
+        - If Copy w/o params: strip placeholders -> {CH} becomes empty
+        - Else: render using current params
+        """
+        if self.copy_wo_params_var.get():
+            return strip_placeholders(raw_joined)
+        return render_keyword(raw_joined, params)
+
     def copy_selected_keywords(self, _event=None):
         sel = list(self.tree.selection())
         if not sel:
@@ -1465,7 +1501,8 @@ class KeywordGuideApp(tk.Tk):
                 continue
             kw = obj["_keywords"][idx]
             raw_joined = keyword_joined_template(kw, delim)
-            rendered = render_keyword(raw_joined, params).strip()
+
+            rendered = self._render_for_copy(raw_joined, params).strip()
             if rendered:
                 rendered_list.append(rendered)
 
@@ -1476,7 +1513,9 @@ class KeywordGuideApp(tk.Tk):
         combined = delim.join(rendered_list)
         self.clipboard_clear()
         self.clipboard_append(combined)
-        self.status_var.set(f"Copied Selected ({len(rendered_list)}): {combined}")
+
+        mode = "NO-PARAMS" if self.copy_wo_params_var.get() else "RENDERED"
+        self.status_var.set(f"Copied Selected ({len(rendered_list)}) [{mode}]: {combined}")
 
     # --------------------------------------------------------
     # Keyword CRUD
@@ -1629,11 +1668,13 @@ class KeywordGuideApp(tk.Tk):
                 desc_rich=kw.get("desc_rich", None),
             )
         elif col == "#4":  # Copy
-            rendered = render_keyword(raw_joined, params)
+            rendered = self._render_for_copy(raw_joined, params)
             self.clipboard_clear()
             self.clipboard_append(rendered)
             self._show_copy_feedback(row)
-            self.status_var.set(f"Copied: {rendered}")
+
+            mode = "NO-PARAMS" if self.copy_wo_params_var.get() else "RENDERED"
+            self.status_var.set(f"Copied [{mode}]: {rendered}")
 
     def on_tree_double_click(self, event):
         col = self.tree.identify_column(event.x)
