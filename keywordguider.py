@@ -4,26 +4,27 @@
 # Version: 0.4.3 (2025-12-29)
 #
 # Release Notes (v0.4.3)
-# - (UX) Window title에 release version 표시
-# - (UX) Copy 시 파라미터 미적용 옵션 추가 (Copy w/o params)
-#        - {CH} 같은 placeholder는 빈 값으로 치환하여 복사
-#        - 단일 Copy / Copy Selected 모두 동일 옵션 적용
+# - (UI) Window title에 release version 표시
+# - (FIX) Param in-place edit: selection_set(None) 오류 방지 + selection 복원 공통 패턴화
+# - (UX) Copy 시 parameter 치환 없이 복사하는 기능 추가
+#        - Row Copy: "Copy" / "CopyNP(No Params)"
+#        - Copy Selected: "Copy Selected" / "Copy Selected NP"
+# - (REFAC) refresh 후 selection 복원을 안전하게 처리하는 유틸 추가
 #
 # Existing (v0.4.2 유지)
-# - Keyword에 "Group" 필드 추가
+# - Keyword에 "Group" 필드
 # - Tree selection bug fix (선택 이벤트에서 tree rebuild 제거)
-# - Keyword Description Rich Text 지원 (Bold + 3 Colors) with desc_rich runs 저장/로드
+# - Keyword Description Rich Text (Bold + 3 Colors) with desc_rich runs
 # - Keyword List: 왼쪽(#0) 체크박스 + extended selection
-# - Select All / Clear All / Copy Selected(선택된 rendered들을 vendor delimiter로 join)
+# - Select All / Clear All / Copy Selected
 # - Up/Down(단일 선택 1개 기준) 위치 변경
 # - Vendor별 Issue 관리 + Vendor별 Delimiter 저장
-# - Keyword CRUD / Copy feedback (Copied bold)
 # - Placeholder detect + Inline Apply (category-level params)
 # - Category-level params in-place edit (Enter/Esc)
 # - UI state persistence
 # - KeywordDialog: Parts fixed height + scroll, Preview wrap+scroll
-# - Import Joined String split: 확인 후 적용
-# - Part 입력 중 delimiter 포함 시 split 제안: 확인 후 적용(자동 아님)
+# - Import Joined String split UX: confirm
+# - Part 입력 중 delimiter 포함 시 split 제안: confirm(자동 아님)
 # ============================================================
 
 import json
@@ -33,13 +34,10 @@ import tkinter as tk
 from tkinter import ttk, messagebox, simpledialog
 
 # ------------------------------------------------------------
-# App Version
+# Paths / Constants
 # ------------------------------------------------------------
 APP_VERSION = "0.4.3"
 
-# ------------------------------------------------------------
-# Paths / Constants
-# ------------------------------------------------------------
 BASE_DIR = Path(__file__).resolve().parent
 DB_PATH = BASE_DIR / "keywords_db.json"
 UI_STATE_PATH = BASE_DIR / "ui_state.json"
@@ -48,15 +46,16 @@ ISSUES_PATH = BASE_DIR / "issues_config.json"
 PLACEHOLDER_RE = re.compile(r"\{([A-Za-z0-9_]+)\}")
 DEFAULT_GEOMETRY = "1250x760"
 
-# Keyword list view: Summary | Group | Info | Copy | Preview
-KEYWORD_COLS = ("summary", "group", "info", "copy", "preview")
+# Keyword list view: Summary | Group | Info | Copy | CopyNP | Preview
+KEYWORD_COLS = ("summary", "group", "info", "copy", "copynp", "preview")
 
 DEFAULT_KEYWORD_COL_WIDTHS = {
     "summary": 240,
     "group": 140,
     "info": 70,
     "copy": 70,
-    "preview": 650,
+    "copynp": 90,
+    "preview": 560,
 }
 
 PARAM_COLS = ("pname", "pval")
@@ -101,6 +100,7 @@ def detect_placeholders(text: str):
 
 
 def render_keyword(template: str, params: dict):
+    """placeholder를 params 값으로 치환"""
     out = template or ""
     params = params or {}
     for k, v in params.items():
@@ -108,12 +108,11 @@ def render_keyword(template: str, params: dict):
     return out
 
 
-def strip_placeholders(template: str) -> str:
-    """
-    Replace all placeholders like {CH}, {ABC} with empty string.
-    Example: "FreeAck;CH:{CH};" -> "FreeAck;CH:;"
-    """
-    return PLACEHOLDER_RE.sub("", template or "")
+def render_keyword_without_params(template: str):
+    """placeholder는 제거(빈값) 처리: {CH} -> "" """
+    if not template:
+        return ""
+    return PLACEHOLDER_RE.sub("", template)
 
 
 def default_issues():
@@ -199,11 +198,6 @@ def normalize_keywords(lst):
     Normalize keyword list items to dict:
       legacy: {"summary":..., "desc":..., "text":...}
       new:    {"summary":..., "group":..., "desc":..., "desc_rich":[...], "parts":[...]}
-    Backward compatible:
-      - string -> {"text": str, "summary":"", "group":"", "desc":""}
-      - {"text","desc"} / {"text","description"}
-      - {"parts":[...]} -> keep parts (trim-only, allow duplicates)
-      - group optional; default ""
     """
     out = []
     for item in lst or []:
@@ -269,27 +263,6 @@ def keyword_parts_from_kw(kw: dict, delimiter: str) -> list[str]:
 # Dialogs
 # ------------------------------------------------------------
 class KeywordDialog(tk.Toplevel):
-    """
-    Keyword input supports multiple parts via dynamic +/- rows.
-
-    Added:
-      - Group field
-
-    Parts 영역:
-      - 고정 height + vertical scroll (Canvas)
-
-    Preview:
-      - wrap + 고정 lines + vertical scroll
-
-    Split UX:
-      - Import Joined String split: 확인 후 적용
-      - Part 입력 중 delimiter 포함: 확인 후 split 제안(자동 아님)
-
-    Description Rich:
-      - Bold + 3 colors (black/red/blue) via Text tags
-      - 저장: desc_rich runs + desc plain 유지
-    """
-
     def __init__(self, parent, title, init=None, delimiter=";"):
         super().__init__(parent)
         self.title(title)
@@ -386,7 +359,6 @@ class KeywordDialog(tk.Toplevel):
         self.preview_scroll.grid(row=0, column=1, sticky="ns", padx=(6, 0))
         self.preview_text.configure(yscrollcommand=self.preview_scroll.set)
 
-        # ---- Description toolbar (rich text) ----
         ttk.Label(frm, text="Description (Bold + Color, Info 팝업으로 표시)").grid(row=11, column=0, sticky="w")
         desc_toolbar = ttk.Frame(frm)
         desc_toolbar.grid(row=12, column=0, sticky="w", pady=(4, 2))
@@ -399,7 +371,6 @@ class KeywordDialog(tk.Toplevel):
         self.txt_desc = tk.Text(frm, height=10, wrap="word")
         self.txt_desc.grid(row=13, column=0, sticky="nsew", pady=(2, 10))
 
-        # tags
         self.txt_desc.tag_configure("b", font=("TkDefaultFont", 9, "bold"))
         self.txt_desc.tag_configure("c_black", foreground="black")
         self.txt_desc.tag_configure("c_red", foreground="red")
@@ -413,7 +384,6 @@ class KeywordDialog(tk.Toplevel):
         frm.columnconfigure(0, weight=1)
         frm.rowconfigure(13, weight=1)
 
-        # Build initial part rows
         initial_parts = keyword_parts_from_kw(init, self.delimiter)
         if not initial_parts:
             initial_parts = [""]
@@ -428,7 +398,6 @@ class KeywordDialog(tk.Toplevel):
 
         self._set_preview_text(self.delimiter.join(self._get_parts()))
 
-        # Load description (rich preferred)
         desc_rich = init.get("desc_rich", None)
         if isinstance(desc_rich, list) and desc_rich:
             self._apply_desc_rich(desc_rich)
@@ -441,7 +410,6 @@ class KeywordDialog(tk.Toplevel):
         ent_sum.focus_set()
         self.wait_window(self)
 
-    # ---------------- Parts scrolling ----------------
     def _on_parts_container_configure(self, _event=None):
         try:
             self.parts_canvas.configure(scrollregion=self.parts_canvas.bbox("all"))
@@ -487,7 +455,6 @@ class KeywordDialog(tk.Toplevel):
         except Exception:
             pass
 
-    # ---------------- Parts CRUD ----------------
     def _add_part_row(self, initial_text=""):
         row = ttk.Frame(self.parts_container)
         row.pack(fill=tk.X, pady=2)
@@ -564,7 +531,6 @@ class KeywordDialog(tk.Toplevel):
         except Exception:
             pass
 
-    # ---------------- Preview ----------------
     def _set_preview_text(self, text: str):
         self.preview_text.configure(state="normal")
         self.preview_text.delete("1.0", "end")
@@ -579,7 +545,6 @@ class KeywordDialog(tk.Toplevel):
         joined = self.delimiter.join(self._get_parts())
         self._set_preview_text(joined)
 
-    # ---------------- Split UX ----------------
     def _split_by_delimiter(self, text: str) -> list[str]:
         delim = self.delimiter if self.delimiter is not None else DEFAULT_DELIMITER
         delim = str(delim)
@@ -665,7 +630,6 @@ class KeywordDialog(tk.Toplevel):
         finally:
             self._split_offer_inflight = False
 
-    # ---------------- Description Rich ----------------
     def _get_sel_range(self):
         try:
             start = self.txt_desc.index("sel.first")
@@ -764,7 +728,6 @@ class KeywordDialog(tk.Toplevel):
             if c in DESC_COLOR_KEYS:
                 self.txt_desc.tag_add(f"c_{c}", start, end)
 
-    # ---------------- OK / Cancel ----------------
     def _ok(self):
         parts = self._get_parts()
         if not parts:
@@ -778,8 +741,8 @@ class KeywordDialog(tk.Toplevel):
             "parts": parts,
             "summary": self.var_summary.get().strip(),
             "group": self.var_group.get().strip(),
-            "desc": desc_plain,          # legacy 유지
-            "desc_rich": desc_rich,      # 신규 rich
+            "desc": desc_plain,
+            "desc_rich": desc_rich,
         }
         self.destroy()
 
@@ -859,7 +822,7 @@ class InfoPopup(tk.Toplevel):
 class KeywordGuideApp(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title(f"Chipset Log Keyword Guide v{APP_VERSION}")
+        self.title(f"Chipset Log Keyword Guide  v{APP_VERSION}")
 
         self.db = load_json(DB_PATH) or self._default_db()
         self.ui_state = load_json(UI_STATE_PATH)
@@ -879,9 +842,6 @@ class KeywordGuideApp(tk.Tk):
         self.status_var = tk.StringVar(value="Ready")
         self.delim_var = tk.StringVar(value=DEFAULT_DELIMITER)
 
-        # Copy mode
-        self.copy_wo_params_var = tk.BooleanVar(value=False)
-
         self._param_editor = None
         self._param_editing = None
 
@@ -896,6 +856,58 @@ class KeywordGuideApp(tk.Tk):
         self._init_vendor()
         self._ensure_current_obj_migrated()
         self.protocol("WM_DELETE_WINDOW", self.on_close)
+
+    # --------------------------------------------------------
+    # Selection restore helpers (공통 패턴)
+    # --------------------------------------------------------
+    def _safe_tree_restore_selection(self, iids: list[str] | None, focus_iid: str | None = None):
+        """Keyword tree selection 복원 (존재하는 iid만) + checkbox sync"""
+        if iids is None:
+            iids = []
+        existing = set(self.tree.get_children(""))
+        valid = [iid for iid in iids if iid in existing]
+
+        try:
+            self.tree.selection_remove(self.tree.selection())
+        except Exception:
+            pass
+
+        if valid:
+            # extended selection 유지
+            try:
+                self.tree.selection_set(valid[0])
+                for iid in valid[1:]:
+                    self.tree.selection_add(iid)
+            except Exception:
+                pass
+
+            tgt = focus_iid if (focus_iid in existing) else valid[0]
+            try:
+                self.tree.see(tgt)
+            except Exception:
+                pass
+
+        self._sync_checkboxes_with_selection()
+
+    def _safe_param_restore_selection(self, iid: str | None):
+        """param tree selection 복원"""
+        if not iid:
+            return
+        try:
+            if iid in self.param_tree.get_children(""):
+                self.param_tree.selection_set(iid)
+                self.param_tree.see(iid)
+        except Exception:
+            pass
+
+    def _tree_selected_iids_sorted(self) -> list[str]:
+        sel = list(self.tree.selection())
+        if not sel:
+            return []
+        try:
+            return sorted(sel, key=lambda x: int(x))
+        except Exception:
+            return sel
 
     # --------------------------------------------------------
     # Checkbox Images + Sync
@@ -1109,7 +1121,7 @@ class KeywordGuideApp(tk.Tk):
         right = ttk.Frame(root)
         right.grid(row=0, column=1, sticky="nsew", padx=(12, 0))
 
-        ttk.Label(right, text="Keywords: [ ] / Summary / Group / Info / Copy / Preview(Rendered)").grid(
+        ttk.Label(right, text="Keywords: [ ] / Summary / Group / Info / Copy / CopyNP / Preview(Rendered)").grid(
             row=0, column=0, sticky="w"
         )
 
@@ -1129,6 +1141,7 @@ class KeywordGuideApp(tk.Tk):
             "group": "Group",
             "info": "Info",
             "copy": "Copy",
+            "copynp": "CopyNP",
             "preview": "Preview",
         }
         for c in KEYWORD_COLS:
@@ -1138,6 +1151,7 @@ class KeywordGuideApp(tk.Tk):
         self.tree.column("group", width=DEFAULT_KEYWORD_COL_WIDTHS["group"], anchor="w", stretch=False)
         self.tree.column("info", width=DEFAULT_KEYWORD_COL_WIDTHS["info"], anchor="center", stretch=False)
         self.tree.column("copy", width=DEFAULT_KEYWORD_COL_WIDTHS["copy"], anchor="center", stretch=False)
+        self.tree.column("copynp", width=DEFAULT_KEYWORD_COL_WIDTHS["copynp"], anchor="center", stretch=False)
         self.tree.column("preview", width=DEFAULT_KEYWORD_COL_WIDTHS["preview"], anchor="w", stretch=True)
 
         self.tree.grid(row=1, column=0, sticky="nsew", pady=(4, 0))
@@ -1174,12 +1188,7 @@ class KeywordGuideApp(tk.Tk):
         ttk.Separator(btns, orient="vertical").pack(side=tk.LEFT, fill=tk.Y, padx=10)
 
         ttk.Button(btns, text="Copy Selected", command=self.copy_selected_keywords).pack(side=tk.LEFT, padx=4)
-
-        # NEW: copy w/o params toggle
-        ttk.Checkbutton(btns, text="Copy w/o params", variable=self.copy_wo_params_var).pack(
-            side=tk.LEFT, padx=(10, 4)
-        )
-
+        ttk.Button(btns, text="Copy Selected NP", command=self.copy_selected_keywords_no_params).pack(side=tk.LEFT, padx=4)
         ttk.Button(btns, text="Reset UI Layout", command=self.reset_ui_layout).pack(side=tk.LEFT, padx=12)
 
         self.inline_box = ttk.LabelFrame(right, text="Inline Parameters (selected keyword placeholders)")
@@ -1277,9 +1286,14 @@ class KeywordGuideApp(tk.Tk):
             if not messagebox.askyesno("Confirm", "Delimiter is empty. Continue?"):
                 return
 
+        # selection 유지
+        saved_sel = self._tree_selected_iids_sorted()
+        focus = saved_sel[0] if saved_sel else None
+
         self._set_vendor_delimiter(v, str(delim))
         self._persist_issues(f"Delimiter updated for {v}: '{delim}'")
         self.refresh_keywords()
+        self._safe_tree_restore_selection(saved_sel, focus_iid=focus)
         self.on_keyword_select()
 
     # --------------------------------------------------------
@@ -1318,6 +1332,7 @@ class KeywordGuideApp(tk.Tk):
         self.clear_inline()
 
     def refresh_keywords(self):
+        """tree rebuild: 호출하는 쪽에서 selection 백업/복원 패턴을 사용 권장"""
         self._clear_copy_feedback(force=True)
         self.tree.delete(*self.tree.get_children())
 
@@ -1330,12 +1345,10 @@ class KeywordGuideApp(tk.Tk):
             raw_joined = keyword_joined_template(kw, delim)
             summary = kw.get("summary", "")
             group = kw.get("group", "")
-
-            # Preview는 항상 rendered (기존 유지)
             preview = render_keyword(raw_joined, params)
 
             iid = str(idx)
-            self.tree.insert("", "end", iid=iid, text="", values=(summary, group, "Info", "Copy", preview))
+            self.tree.insert("", "end", iid=iid, text="", values=(summary, group, "Info", "Copy", "CopyNP", preview))
             self._set_checkbox_for_iid(iid, checked=False)
 
         self._sync_checkboxes_with_selection()
@@ -1344,7 +1357,6 @@ class KeywordGuideApp(tk.Tk):
         self.status_var.set(f"Selected: {v} > {i} > {d}")
 
     def refresh_keyword_previews_only(self):
-        """Treeview 전체 재생성 없이 preview 컬럼만 업데이트"""
         obj = self._current_obj()
         params = obj["_params"]
         v = self.vendor_var.get()
@@ -1383,7 +1395,6 @@ class KeywordGuideApp(tk.Tk):
         )
 
     def on_keyword_select(self, *_):
-        # IMPORTANT: do NOT rebuild tree here. Only update inline panel and preview cells.
         self._sync_checkboxes_with_selection()
 
         for w in self.inline_box.winfo_children():
@@ -1435,7 +1446,6 @@ class KeywordGuideApp(tk.Tk):
                 side=tk.LEFT
             )
 
-        # update only params panel + previews (no tree rebuild)
         self.refresh_params()
         self.refresh_keyword_previews_only()
 
@@ -1465,21 +1475,10 @@ class KeywordGuideApp(tk.Tk):
     # --------------------------------------------------------
     # Bulk copy selected keywords
     # --------------------------------------------------------
-    def _render_for_copy(self, raw_joined: str, params: dict) -> str:
-        """
-        Copy output generator.
-        - If Copy w/o params: strip placeholders -> {CH} becomes empty
-        - Else: render using current params
-        """
-        if self.copy_wo_params_var.get():
-            return strip_placeholders(raw_joined)
-        return render_keyword(raw_joined, params)
-
-    def copy_selected_keywords(self, _event=None):
+    def _collect_selected_joined_templates(self) -> list[str]:
         sel = list(self.tree.selection())
         if not sel:
-            self.status_var.set("No selection to copy.")
-            return
+            return []
 
         try:
             sel_sorted = sorted(sel, key=lambda x: int(x))
@@ -1487,11 +1486,10 @@ class KeywordGuideApp(tk.Tk):
             sel_sorted = sel
 
         obj = self._current_obj()
-        params = obj["_params"]
         v = self.vendor_var.get()
         delim = self._get_vendor_delimiter(v)
 
-        rendered_list = []
+        joined_list = []
         for iid in sel_sorted:
             try:
                 idx = int(iid)
@@ -1500,9 +1498,26 @@ class KeywordGuideApp(tk.Tk):
             if idx < 0 or idx >= len(obj["_keywords"]):
                 continue
             kw = obj["_keywords"][idx]
-            raw_joined = keyword_joined_template(kw, delim)
+            raw_joined = keyword_joined_template(kw, delim).strip()
+            if raw_joined:
+                joined_list.append(raw_joined)
 
-            rendered = self._render_for_copy(raw_joined, params).strip()
+        return joined_list
+
+    def copy_selected_keywords(self, _event=None):
+        joined_list = self._collect_selected_joined_templates()
+        if not joined_list:
+            self.status_var.set("No selection to copy.")
+            return
+
+        obj = self._current_obj()
+        params = obj["_params"]
+        v = self.vendor_var.get()
+        delim = self._get_vendor_delimiter(v)
+
+        rendered_list = []
+        for raw_joined in joined_list:
+            rendered = render_keyword(raw_joined, params).strip()
             if rendered:
                 rendered_list.append(rendered)
 
@@ -1513,9 +1528,26 @@ class KeywordGuideApp(tk.Tk):
         combined = delim.join(rendered_list)
         self.clipboard_clear()
         self.clipboard_append(combined)
+        self.status_var.set(f"Copied Selected ({len(rendered_list)}): {combined}")
 
-        mode = "NO-PARAMS" if self.copy_wo_params_var.get() else "RENDERED"
-        self.status_var.set(f"Copied Selected ({len(rendered_list)}) [{mode}]: {combined}")
+    def copy_selected_keywords_no_params(self):
+        joined_list = self._collect_selected_joined_templates()
+        if not joined_list:
+            self.status_var.set("No selection to copy.")
+            return
+
+        v = self.vendor_var.get()
+        delim = self._get_vendor_delimiter(v)
+
+        rendered_list = []
+        for raw_joined in joined_list:
+            np = render_keyword_without_params(raw_joined).strip()
+            rendered_list.append(np)
+
+        combined = delim.join(rendered_list)
+        self.clipboard_clear()
+        self.clipboard_append(combined)
+        self.status_var.set(f"Copied Selected NP ({len(rendered_list)}): {combined}")
 
     # --------------------------------------------------------
     # Keyword CRUD
@@ -1542,12 +1574,17 @@ class KeywordGuideApp(tk.Tk):
             obj = self._current_obj()
             obj["_keywords"].append(dlg.result)
             self._persist_db("Keyword added")
+
+            # selection 복원: 새 row 선택
             self.refresh_keywords()
+            new_iid = str(len(obj["_keywords"]) - 1)
+            self._safe_tree_restore_selection([new_iid], focus_iid=new_iid)
 
     def edit_keyword(self):
         idx = self._selected_keyword_index()
         if idx is None:
             return
+
         obj = self._current_obj()
         kw = obj["_keywords"][idx]
 
@@ -1558,25 +1595,45 @@ class KeywordGuideApp(tk.Tk):
         if dlg.result:
             obj["_keywords"][idx] = dlg.result
             self._persist_db("Keyword edited")
+
+            saved = self._tree_selected_iids_sorted()
+            focus = str(idx)
             self.refresh_keywords()
+            self._safe_tree_restore_selection(saved or [focus], focus_iid=focus)
 
     def remove_keyword(self):
+        saved = self._tree_selected_iids_sorted()
         idx = self._selected_keyword_index()
         if idx is None:
             return
+
         obj = self._current_obj()
         del obj["_keywords"][idx]
         self._persist_db("Keyword removed")
+
         self.refresh_keywords()
+
+        # 삭제 후 selection: 같은 index가 존재하면 그걸, 아니면 마지막
+        new_len = len(obj["_keywords"])
+        if new_len <= 0:
+            self.clear_inline()
+            return
+        new_idx = min(idx, new_len - 1)
+        focus = str(new_idx)
+        self._safe_tree_restore_selection([focus], focus_iid=focus)
         self.clear_inline()
 
     # --------------------------------------------------------
-    # Up / Down (single selection only)
+    # Up / Down (single selection only) with restore pattern
     # --------------------------------------------------------
     def move_keyword_up(self):
-        sel = list(self.tree.selection())
+        sel = self._tree_selected_iids_sorted()
         if not sel:
             return
+        if len(sel) != 1:
+            self.status_var.set("Up/Down은 단일 선택 1개에서만 동작합니다.")
+            return
+
         try:
             idx = int(sel[0])
         except Exception:
@@ -1589,21 +1646,20 @@ class KeywordGuideApp(tk.Tk):
 
         kws[idx - 1], kws[idx] = kws[idx], kws[idx - 1]
         obj["_keywords"] = kws
-
         self._persist_db("Keyword moved up")
-        self.refresh_keywords()
 
-        new_iid = str(idx - 1)
-        try:
-            self.tree.selection_set(new_iid)
-            self.tree.see(new_iid)
-        except Exception:
-            pass
+        self.refresh_keywords()
+        focus = str(idx - 1)
+        self._safe_tree_restore_selection([focus], focus_iid=focus)
 
     def move_keyword_down(self):
-        sel = list(self.tree.selection())
+        sel = self._tree_selected_iids_sorted()
         if not sel:
             return
+        if len(sel) != 1:
+            self.status_var.set("Up/Down은 단일 선택 1개에서만 동작합니다.")
+            return
+
         try:
             idx = int(sel[0])
         except Exception:
@@ -1616,16 +1672,11 @@ class KeywordGuideApp(tk.Tk):
 
         kws[idx + 1], kws[idx] = kws[idx], kws[idx + 1]
         obj["_keywords"] = kws
-
         self._persist_db("Keyword moved down")
-        self.refresh_keywords()
 
-        new_iid = str(idx + 1)
-        try:
-            self.tree.selection_set(new_iid)
-            self.tree.see(new_iid)
-        except Exception:
-            pass
+        self.refresh_keywords()
+        focus = str(idx + 1)
+        self._safe_tree_restore_selection([focus], focus_iid=focus)
 
     # --------------------------------------------------------
     # Keyword Tree click handlers
@@ -1656,7 +1707,7 @@ class KeywordGuideApp(tk.Tk):
         delim = self._get_vendor_delimiter(v)
         raw_joined = keyword_joined_template(kw, delim)
 
-        # columns: #0 checkbox, #1 summary, #2 group, #3 info, #4 copy, #5 preview
+        # columns: #0 checkbox, #1 summary, #2 group, #3 info, #4 copy, #5 copynp, #6 preview
         if col == "#3":  # Info
             InfoPopup(
                 self,
@@ -1667,32 +1718,41 @@ class KeywordGuideApp(tk.Tk):
                 desc=kw.get("desc", ""),
                 desc_rich=kw.get("desc_rich", None),
             )
-        elif col == "#4":  # Copy
-            rendered = self._render_for_copy(raw_joined, params)
+
+        elif col == "#4":  # Copy (with params)
+            rendered = render_keyword(raw_joined, params)
             self.clipboard_clear()
             self.clipboard_append(rendered)
-            self._show_copy_feedback(row)
+            self._show_copy_feedback(row, which="copy")
+            self.status_var.set(f"Copied: {rendered}")
 
-            mode = "NO-PARAMS" if self.copy_wo_params_var.get() else "RENDERED"
-            self.status_var.set(f"Copied [{mode}]: {rendered}")
+        elif col == "#5":  # CopyNP (without params)
+            rendered = render_keyword_without_params(raw_joined)
+            self.clipboard_clear()
+            self.clipboard_append(rendered)
+            self._show_copy_feedback(row, which="copynp")
+            self.status_var.set(f"Copied NP: {rendered}")
 
     def on_tree_double_click(self, event):
         col = self.tree.identify_column(event.x)
-        if col in ("#0", "#3", "#4"):
+        if col in ("#0", "#3", "#4", "#5"):
             return
         self.edit_keyword()
 
     # --------------------------------------------------------
     # Copy feedback UI
     # --------------------------------------------------------
-    def _show_copy_feedback(self, row_iid: str):
+    def _show_copy_feedback(self, row_iid: str, which: str = "copy"):
         self._clear_copy_feedback(force=True)
 
         try:
             vals = list(self.tree.item(row_iid, "values"))
             if len(vals) == len(KEYWORD_COLS):
-                # copy column index = 3 in KEYWORD_COLS ("summary","group","info","copy","preview")
-                vals[3] = "Copied"
+                # KEYWORD_COLS: summary, group, info, copy, copynp, preview
+                if which == "copynp":
+                    vals[4] = "Copied"
+                else:
+                    vals[3] = "Copied"
                 self.tree.item(row_iid, values=tuple(vals))
         except Exception:
             pass
@@ -1729,6 +1789,7 @@ class KeywordGuideApp(tk.Tk):
             vals = list(self.tree.item(row_iid, "values"))
             if len(vals) == len(KEYWORD_COLS):
                 vals[3] = "Copy"
+                vals[4] = "CopyNP"
                 self.tree.item(row_iid, values=tuple(vals))
         except Exception:
             pass
@@ -1757,7 +1818,9 @@ class KeywordGuideApp(tk.Tk):
         val = simpledialog.askstring("Add Param", f"Value for {name}:") or ""
         obj["_params"][name] = val
         self._persist_db("Param added")
+
         self.refresh_params()
+        self._safe_param_restore_selection(name)
         self.refresh_keyword_previews_only()
 
     def remove_param(self):
@@ -1775,11 +1838,12 @@ class KeywordGuideApp(tk.Tk):
 
         del obj["_params"][pname]
         self._persist_db("Param removed")
+
         self.refresh_params()
         self.refresh_keyword_previews_only()
 
     # --------------------------------------------------------
-    # Param in-place edit
+    # Param in-place edit (FIX + selection restore pattern)
     # --------------------------------------------------------
     def on_param_cell_double_click(self, event):
         if self._param_editor:
@@ -1814,15 +1878,18 @@ class KeywordGuideApp(tk.Tk):
         if not self._param_editor or not self._param_editing:
             return
 
+        editing_key = self._param_editing  # 로컬 백업
         new_val = self._param_editor.get()
-        obj = self._current_obj()
-        obj["_params"][self._param_editing] = new_val
 
-        self._persist_db(f"Param updated: {self._param_editing}={new_val}")
+        obj = self._current_obj()
+        obj["_params"][editing_key] = new_val
+        self._persist_db(f"Param updated: {editing_key}={new_val}")
+
         self._cancel_param_edit()
         self.refresh_params()
+        self._safe_param_restore_selection(editing_key)
+
         self.refresh_keyword_previews_only()
-        self.param_tree.selection_set(self._param_editing)
 
     def _cancel_param_edit(self):
         if self._param_editor:
