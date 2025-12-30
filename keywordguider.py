@@ -1,19 +1,20 @@
 # ============================================================
 # Keyword Guide UI POC
 # ------------------------------------------------------------
-# Version: 0.4.4 (2025-12-30)
+# Version: 0.4.5 (2025-12-30)
 #
-# Release Notes (v0.4.4)
-# - (FIX/UX) Copy Selected NP: placeholder 제거 후 결과가 빈 문자열인 항목은 skip 처리
-# - (UX) refresh_all: Keyword tree refresh 시 selection(checkbox 포함) 복원 후 inline/preview 갱신
+# Release Notes (v0.4.5)
+# - (UI) Left navigation 변경: Vendor/Issue/Detail Combobox -> Tree Navigator
+#        - Vendor -> Issue -> Detail Category 계층 구조
+#        - 기본 expand/collapse(+/-) 제공 (ttk.Treeview)
+# - (UX) Nav tree rebuild 시 selection 유지(restore_path) + DB/IssueCfg 정합성 보정 포함
 #
 # Existing (v0.4.3 유지)
-# - (UI) Window title에 release version 표시
-# - (FIX) Param in-place edit: selection_set(None) 오류 방지 + selection 복원 공통 패턴화
-# - (UX) Copy 시 parameter 치환 없이 복사하는 기능 추가
-#        - Row Copy: "Copy" / "CopyNP(No Params)"
-#        - Copy Selected: "Copy Selected" / "Copy Selected NP"
-# - (REFAC) refresh 후 selection 복원을 안전하게 처리하는 유틸 추가
+# - Window title에 release version 표시
+# - Param in-place edit: selection_set(None) 오류 방지 + selection 복원 공통 패턴화
+# - Copy 시 parameter 치환 없이 복사하는 기능 추가
+#   - Row Copy: "Copy" / "CopyNP(No Params)"
+#   - Copy Selected: "Copy Selected" / "Copy Selected NP"
 # - Keyword에 "Group" 필드
 # - Tree selection bug fix (선택 이벤트에서 tree rebuild 제거)
 # - Keyword Description Rich Text (Bold + 3 Colors) with desc_rich runs
@@ -23,7 +24,7 @@
 # - Vendor별 Issue 관리 + Vendor별 Delimiter 저장
 # - Placeholder detect + Inline Apply (category-level params)
 # - Category-level params in-place edit (Enter/Esc)
-# - UI state persistence
+# - UI state persistence (column widths, geometry)
 # - KeywordDialog: Parts fixed height + scroll, Preview wrap+scroll
 # - Import Joined String split UX: confirm
 # - Part 입력 중 delimiter 포함 시 split 제안: confirm(자동 아님)
@@ -38,7 +39,7 @@ from tkinter import ttk, messagebox, simpledialog
 # ------------------------------------------------------------
 # Paths / Constants
 # ------------------------------------------------------------
-APP_VERSION = "0.4.4"
+APP_VERSION = "0.4.5"
 
 BASE_DIR = Path(__file__).resolve().parent
 DB_PATH = BASE_DIR / "keywords_db.json"
@@ -836,6 +837,8 @@ class KeywordGuideApp(tk.Tk):
 
         raw_cfg = load_json(ISSUES_PATH)
         self.issue_cfg = ensure_issue_config_vendor_scoped(raw_cfg, vendors)
+
+        # [주의1] DB/IssueCfg 정합성 보정: nav_tree build 전에 반드시 수행
         self._sync_vendor_scoped_config_with_db()
 
         self.vendor_var = tk.StringVar()
@@ -855,7 +858,10 @@ class KeywordGuideApp(tk.Tk):
         self._make_checkbox_images()
 
         self._apply_saved_widths()
+
+        # nav tree build + default selection
         self._init_vendor()
+
         self._ensure_current_obj_migrated()
         self.protocol("WM_DELETE_WINDOW", self.on_close)
 
@@ -1013,6 +1019,11 @@ class KeywordGuideApp(tk.Tk):
             self.status_var.set(f"Save failed: {e}")
 
     def _sync_vendor_scoped_config_with_db(self):
+        """
+        [주의1] DB/IssueCfg 정합성 보정:
+          - vendor list, issue list, delimiter 값, db issue 키 등 상호 보정
+          - nav_tree build 전에 반드시 호출
+        """
         if not isinstance(self.db, dict):
             self.db = self._default_db()
 
@@ -1083,41 +1094,31 @@ class KeywordGuideApp(tk.Tk):
         left = ttk.Frame(root)
         left.grid(row=0, column=0, sticky="ns")
 
-        ttk.Label(left, text="Vendor").pack(anchor="w")
-        self.vendor_cb = ttk.Combobox(left, textvariable=self.vendor_var, state="readonly", width=26)
-        self.vendor_cb.pack(fill=tk.X)
-        self.vendor_cb.bind("<<ComboboxSelected>>", self.on_vendor_change)
+        # ===== Left Navigator Tree =====
+        ttk.Label(left, text="Navigator (Vendor > Issue > Detail)").pack(anchor="w")
+        self.nav_tree = ttk.Treeview(left, show="tree", selectmode="browse", height=24)
+        self.nav_tree.pack(fill=tk.BOTH, expand=True, pady=(4, 8))
 
-        ttk.Label(left, text="Keyword Delimiter (Vendor)").pack(anchor="w", pady=(10, 0))
+        nav_sb = ttk.Scrollbar(left, orient="vertical", command=self.nav_tree.yview)
+        self.nav_tree.configure(yscrollcommand=nav_sb.set)
+        nav_sb.place(in_=self.nav_tree, relx=1.0, rely=0, relheight=1.0, anchor="ne")
+
+        self.nav_tree.bind("<<TreeviewSelect>>", self.on_nav_select)
+
+        # Vendor delimiter control
+        ttk.Label(left, text="Keyword Delimiter (Vendor)").pack(anchor="w", pady=(6, 0))
         delim_row = ttk.Frame(left)
         delim_row.pack(fill=tk.X)
         self.delim_entry = ttk.Entry(delim_row, textvariable=self.delim_var, width=8)
         self.delim_entry.pack(side=tk.LEFT, padx=(0, 6))
         ttk.Button(delim_row, text="Apply", command=self.apply_vendor_delimiter).pack(side=tk.LEFT)
 
-        ttk.Label(left, text="Issue").pack(anchor="w", pady=(10, 0))
-        issue_row = ttk.Frame(left)
-        issue_row.pack(fill=tk.X)
-
-        self.issue_cb = ttk.Combobox(issue_row, textvariable=self.issue_var, state="readonly", width=18)
-        self.issue_cb.pack(side=tk.LEFT, fill=tk.X, expand=True)
-        self.issue_cb.bind("<<ComboboxSelected>>", self.on_issue_change)
-
-        ttk.Button(issue_row, text="+", width=3, command=self.add_issue).pack(side=tk.LEFT, padx=3)
-        ttk.Button(issue_row, text="-", width=3, command=self.delete_issue).pack(side=tk.LEFT, padx=3)
-        ttk.Button(issue_row, text="R", width=3, command=self.rename_issue).pack(side=tk.LEFT, padx=3)
-
-        ttk.Label(left, text="Detail Category").pack(anchor="w", pady=(10, 0))
-        row = ttk.Frame(left)
-        row.pack(fill=tk.X)
-
-        self.detail_cb = ttk.Combobox(row, textvariable=self.detail_var, state="readonly", width=18)
-        self.detail_cb.pack(side=tk.LEFT, fill=tk.X, expand=True)
-        self.detail_cb.bind("<<ComboboxSelected>>", self.refresh_all)
-
-        ttk.Button(row, text="+", width=3, command=self.add_category).pack(side=tk.LEFT, padx=3)
-        ttk.Button(row, text="-", width=3, command=self.delete_category).pack(side=tk.LEFT, padx=3)
-        ttk.Button(row, text="R", width=3, command=self.rename_category).pack(side=tk.LEFT, padx=3)
+        # CRUD controls depending on selection depth
+        crud = ttk.LabelFrame(left, text="Edit (Issue/Detail)")
+        crud.pack(fill=tk.X, pady=(10, 0))
+        ttk.Button(crud, text="+ Add", command=self.nav_add).pack(fill=tk.X, padx=6, pady=(6, 2))
+        ttk.Button(crud, text="- Delete", command=self.nav_delete).pack(fill=tk.X, padx=6, pady=2)
+        ttk.Button(crud, text="R Rename", command=self.nav_rename).pack(fill=tk.X, padx=6, pady=(2, 6))
 
         right = ttk.Frame(root)
         right.grid(row=0, column=1, sticky="nsew", padx=(12, 0))
@@ -1189,9 +1190,7 @@ class KeywordGuideApp(tk.Tk):
         ttk.Separator(btns, orient="vertical").pack(side=tk.LEFT, fill=tk.Y, padx=10)
 
         ttk.Button(btns, text="Copy Selected", command=self.copy_selected_keywords).pack(side=tk.LEFT, padx=4)
-        ttk.Button(btns, text="Copy Selected NP", command=self.copy_selected_keywords_no_params).pack(
-            side=tk.LEFT, padx=4
-        )
+        ttk.Button(btns, text="Copy Selected NP", command=self.copy_selected_keywords_no_params).pack(side=tk.LEFT, padx=4)
         ttk.Button(btns, text="Reset UI Layout", command=self.reset_ui_layout).pack(side=tk.LEFT, padx=12)
 
         self.inline_box = ttk.LabelFrame(right, text="Inline Parameters (selected keyword placeholders)")
@@ -1231,53 +1230,185 @@ class KeywordGuideApp(tk.Tk):
         param_box.rowconfigure(0, weight=1)
 
     # --------------------------------------------------------
-    # Navigation
+    # Left Navigator: Build / Select / CRUD Dispatcher
     # --------------------------------------------------------
     def _init_vendor(self):
+        # [주의2] nav_tree rebuild 시 selection 유지: restore_path 사용
+        self.build_nav_tree(select_default=True)
+
+    def _nav_path(self):
+        v, i, d = self.vendor_var.get(), self.issue_var.get(), self.detail_var.get()
+        if v and i and d:
+            return (v, i, d)
+        return None
+
+    def build_nav_tree(self, select_default=False, restore_path=None):
+        """
+        [주의2] nav_tree rebuild 시 selection 유지:
+          - restore_path = (vendor, issue, detail) 형태로 selection 복원
+          - 복원 실패 시 select_default 로 fallback
+        """
+        # build 전에 정합성 보정(안전)
+        self._sync_vendor_scoped_config_with_db()
+
+        self.nav_tree.delete(*self.nav_tree.get_children(""))
+
         vendors = list(self.db.keys())
-        self.vendor_cb["values"] = vendors
-        self.vendor_var.set(vendors[0])
-        self.on_vendor_change()
+        for v in vendors:
+            vid = f"V|{v}"
+            self.nav_tree.insert("", "end", iid=vid, text=v, open=True)
 
-    def on_vendor_change(self, *_):
-        v = self.vendor_var.get()
-        if not v:
+            issues = self._get_vendor_issues(v)
+            self.db.setdefault(v, {})
+            for issue in issues:
+                self.db[v].setdefault(issue, self._default_issue_obj())
+                iid = f"I|{v}|{issue}"
+                self.nav_tree.insert(vid, "end", iid=iid, text=issue, open=True)
+
+                details = list(self.db[v][issue].keys())
+                for d in details:
+                    did = f"D|{v}|{issue}|{d}"
+                    self.nav_tree.insert(iid, "end", iid=did, text=d, open=False)
+
+        # restore selection
+        if restore_path:
+            v, i, d = restore_path
+            did = f"D|{v}|{i}|{d}"
+            if self.nav_tree.exists(did):
+                self.nav_tree.selection_set(did)
+                self.nav_tree.see(did)
+                self.on_nav_select()
+                return
+            iid = f"I|{v}|{i}"
+            if self.nav_tree.exists(iid):
+                self.nav_tree.selection_set(iid)
+                self.nav_tree.see(iid)
+                self.on_nav_select()
+                return
+            vid = f"V|{v}"
+            if self.nav_tree.exists(vid):
+                self.nav_tree.selection_set(vid)
+                self.nav_tree.see(vid)
+                self.on_nav_select()
+                return
+
+        # default selection
+        if select_default and vendors:
+            v = vendors[0]
+            issues = self._get_vendor_issues(v)
+            if issues:
+                i = issues[0]
+                details = list(self.db[v][i].keys())
+                d = "_COMMON" if "_COMMON" in details else (details[0] if details else "_COMMON")
+                did = f"D|{v}|{i}|{d}"
+                if self.nav_tree.exists(did):
+                    self.nav_tree.selection_set(did)
+                    self.nav_tree.see(did)
+                    self.on_nav_select()
+                    return
+                iid = f"I|{v}|{i}"
+                if self.nav_tree.exists(iid):
+                    self.nav_tree.selection_set(iid)
+                    self.nav_tree.see(iid)
+                    self.on_nav_select()
+                    return
+            vid = f"V|{v}"
+            if self.nav_tree.exists(vid):
+                self.nav_tree.selection_set(vid)
+                self.nav_tree.see(vid)
+                self.on_nav_select()
+                return
+
+    def on_nav_select(self, _event=None):
+        sel = self.nav_tree.selection()
+        if not sel:
+            return
+        node = sel[0]
+        parts = node.split("|")
+        if not parts:
+            return
+        kind = parts[0]
+
+        if kind == "V":
+            v = parts[1]
+            self.vendor_var.set(v)
+            self.delim_var.set(self._get_vendor_delimiter(v))
+
+            issues = self._get_vendor_issues(v)
+            if issues:
+                i = issues[0]
+                self.issue_var.set(i)
+                details = list(self.db[v][i].keys())
+                d = "_COMMON" if "_COMMON" in details else (details[0] if details else "_COMMON")
+                self.detail_var.set(d)
+            self.refresh_all()
             return
 
-        self.issue_cfg = ensure_issue_config_vendor_scoped(self.issue_cfg, list(self.db.keys()))
-        if v not in self.issue_cfg.get("vendors", {}):
-            self.issue_cfg["vendors"][v] = {"issues": default_issues(), "delimiter": DEFAULT_DELIMITER}
-            self._persist_issues("Issue config normalized")
-
-        self.delim_var.set(self._get_vendor_delimiter(v))
-
-        issues = self._get_vendor_issues(v)
-        if not issues:
-            issues = default_issues()
-            self._set_vendor_issues(v, issues)
-            self._persist_issues("Issue config defaulted")
-
-        self.db.setdefault(v, {})
-        for i in issues:
-            self.db[v].setdefault(i, self._default_issue_obj())
-
-        self.issue_cb["values"] = issues
-        self.issue_var.set(issues[0] if issues else "")
-        self.on_issue_change()
-
-    def on_issue_change(self, *_):
-        v, i = self.vendor_var.get(), self.issue_var.get()
-        if not v or not i:
+        if kind == "I":
+            v = parts[1]
+            i = parts[2]
+            self.vendor_var.set(v)
+            self.issue_var.set(i)
+            self.delim_var.set(self._get_vendor_delimiter(v))
+            details = list(self.db[v][i].keys())
+            d = "_COMMON" if "_COMMON" in details else (details[0] if details else "_COMMON")
+            self.detail_var.set(d)
+            self.refresh_all()
             return
 
-        self.db.setdefault(v, {})
-        self.db[v].setdefault(i, self._default_issue_obj())
+        if kind == "D":
+            v = parts[1]
+            i = parts[2]
+            d = "|".join(parts[3:])  # detail에 '|' 포함 가능성 대비
+            self.vendor_var.set(v)
+            self.issue_var.set(i)
+            self.detail_var.set(d)
+            self.delim_var.set(self._get_vendor_delimiter(v))
+            self.refresh_all()
+            return
 
-        details = list(self.db[v][i].keys())
-        self.detail_cb["values"] = details
-        self.detail_var.set("_COMMON" if "_COMMON" in details else (details[0] if details else ""))
-        self.refresh_all()
+    def _nav_get_context(self):
+        sel = self.nav_tree.selection()
+        if not sel:
+            return ("", None)
+        node = sel[0]
+        parts = node.split("|")
+        kind = parts[0] if parts else ""
+        return (kind, parts)
 
+    def nav_add(self):
+        kind, _parts = self._nav_get_context()
+        if kind == "V":
+            self.add_issue()
+        else:
+            self.add_category()
+        self.build_nav_tree(restore_path=self._nav_path())
+
+    def nav_delete(self):
+        kind, _parts = self._nav_get_context()
+        if kind == "I":
+            self.delete_issue()
+        elif kind == "D":
+            self.delete_category()
+        else:
+            messagebox.showinfo("Info", "Delete는 Issue 또는 Detail 선택 시 동작합니다.")
+            return
+        self.build_nav_tree(restore_path=self._nav_path())
+
+    def nav_rename(self):
+        kind, _parts = self._nav_get_context()
+        if kind == "I":
+            self.rename_issue()
+        elif kind == "D":
+            self.rename_category()
+        else:
+            messagebox.showinfo("Info", "Rename은 Issue 또는 Detail 선택 시 동작합니다.")
+            return
+        self.build_nav_tree(restore_path=self._nav_path())
+
+    # --------------------------------------------------------
+    # Delimiter
+    # --------------------------------------------------------
     def apply_vendor_delimiter(self):
         v = self.vendor_var.get()
         if not v:
@@ -1303,6 +1434,16 @@ class KeywordGuideApp(tk.Tk):
     # --------------------------------------------------------
     def _current_obj(self):
         v, i, d = self.vendor_var.get(), self.issue_var.get(), self.detail_var.get()
+        if not v:
+            v = list(self.db.keys())[0]
+            self.vendor_var.set(v)
+        if not i:
+            issues = self._get_vendor_issues(v)
+            i = issues[0] if issues else default_issues()[0]
+            self.issue_var.set(i)
+        if not d:
+            d = "_COMMON"
+            self.detail_var.set(d)
 
         self.db.setdefault(v, {})
         self.db[v].setdefault(i, self._default_issue_obj())
@@ -1329,18 +1470,11 @@ class KeywordGuideApp(tk.Tk):
     # Refresh
     # --------------------------------------------------------
     def refresh_all(self, *_):
-        # v0.4.4: selection(checkbox 포함) 유지 + inline/preview 갱신
-        saved_sel = self._tree_selected_iids_sorted()
-        focus = saved_sel[0] if saved_sel else None
-
         self.refresh_keywords()
         self.refresh_params()
-
-        self._safe_tree_restore_selection(saved_sel, focus_iid=focus)
-        self.on_keyword_select()
+        self.clear_inline()
 
     def refresh_keywords(self):
-        """tree rebuild: 호출하는 쪽에서 selection 백업/복원 패턴을 사용 권장"""
         self._clear_copy_feedback(force=True)
         self.tree.delete(*self.tree.get_children())
 
@@ -1550,12 +1684,7 @@ class KeywordGuideApp(tk.Tk):
         rendered_list = []
         for raw_joined in joined_list:
             np = render_keyword_without_params(raw_joined).strip()
-            if np:  # v0.4.4: 빈 문자열 skip
-                rendered_list.append(np)
-
-        if not rendered_list:
-            self.status_var.set("No valid keywords to copy (NP).")
-            return
+            rendered_list.append(np)
 
         combined = delim.join(rendered_list)
         self.clipboard_clear()
@@ -1635,7 +1764,7 @@ class KeywordGuideApp(tk.Tk):
         self.clear_inline()
 
     # --------------------------------------------------------
-    # Up / Down (single selection only) with restore pattern
+    # Up / Down (single selection only)
     # --------------------------------------------------------
     def move_keyword_up(self):
         sel = self._tree_selected_iids_sorted()
@@ -1718,7 +1847,6 @@ class KeywordGuideApp(tk.Tk):
         delim = self._get_vendor_delimiter(v)
         raw_joined = keyword_joined_template(kw, delim)
 
-        # columns: #0 checkbox, #1 summary, #2 group, #3 info, #4 copy, #5 copynp, #6 preview
         if col == "#3":  # Info
             InfoPopup(
                 self,
@@ -1729,14 +1857,12 @@ class KeywordGuideApp(tk.Tk):
                 desc=kw.get("desc", ""),
                 desc_rich=kw.get("desc_rich", None),
             )
-
         elif col == "#4":  # Copy (with params)
             rendered = render_keyword(raw_joined, params)
             self.clipboard_clear()
             self.clipboard_append(rendered)
             self._show_copy_feedback(row, which="copy")
             self.status_var.set(f"Copied: {rendered}")
-
         elif col == "#5":  # CopyNP (without params)
             rendered = render_keyword_without_params(raw_joined)
             self.clipboard_clear()
@@ -1918,6 +2044,9 @@ class KeywordGuideApp(tk.Tk):
     # --------------------------------------------------------
     def add_category(self):
         v, i = self.vendor_var.get(), self.issue_var.get()
+        if not v or not i:
+            return
+
         name = simpledialog.askstring("Add Category", "Category name:")
         if not name:
             return
@@ -1934,12 +2063,13 @@ class KeywordGuideApp(tk.Tk):
 
         self.db[v][i][name] = {"_keywords": [], "_params": {}}
         self._persist_db("Category added")
-        self.detail_cb["values"] = list(self.db[v][i].keys())
         self.detail_var.set(name)
         self.refresh_all()
 
     def delete_category(self):
         v, i, d = self.vendor_var.get(), self.issue_var.get(), self.detail_var.get()
+        if not v or not i or not d:
+            return
         if d == "_COMMON":
             messagebox.showinfo("Info", "_COMMON cannot be deleted.")
             return
@@ -1950,13 +2080,14 @@ class KeywordGuideApp(tk.Tk):
         del self.db[v][i][d]
         self._persist_db("Category deleted")
 
-        self.detail_cb["values"] = list(self.db[v][i].keys())
         details = list(self.db[v][i].keys())
         self.detail_var.set("_COMMON" if "_COMMON" in details else (details[0] if details else "_COMMON"))
         self.refresh_all()
 
     def rename_category(self):
         v, i, d = self.vendor_var.get(), self.issue_var.get(), self.detail_var.get()
+        if not v or not i or not d:
+            return
         if d == "_COMMON":
             messagebox.showinfo("Info", "_COMMON cannot be renamed.")
             return
@@ -1975,7 +2106,6 @@ class KeywordGuideApp(tk.Tk):
         self.db[v][i][new] = self.db[v][i].pop(d)
         self._persist_db("Category renamed")
 
-        self.detail_cb["values"] = list(self.db[v][i].keys())
         self.detail_var.set(new)
         self.refresh_all()
 
@@ -2007,9 +2137,10 @@ class KeywordGuideApp(tk.Tk):
         self.db[v].setdefault(name, self._default_issue_obj())
         self._persist_db(f"DB synced (issue added) for {v}")
 
-        self.issue_cb["values"] = issues
         self.issue_var.set(name)
-        self.on_issue_change()
+        details = list(self.db[v][name].keys())
+        self.detail_var.set("_COMMON" if "_COMMON" in details else (details[0] if details else "_COMMON"))
+        self.refresh_all()
 
     def delete_issue(self):
         v = self.vendor_var.get()
@@ -2036,9 +2167,10 @@ class KeywordGuideApp(tk.Tk):
             del self.db[v][cur]
         self._persist_db(f"DB synced (issue deleted) for {v}")
 
-        self.issue_cb["values"] = issues
         self.issue_var.set(issues[0])
-        self.on_issue_change()
+        details = list(self.db[v][issues[0]].keys())
+        self.detail_var.set("_COMMON" if "_COMMON" in details else (details[0] if details else "_COMMON"))
+        self.refresh_all()
 
     def rename_issue(self):
         v = self.vendor_var.get()
@@ -2075,9 +2207,10 @@ class KeywordGuideApp(tk.Tk):
             self.db[v][new] = self._default_issue_obj()
         self._persist_db(f"DB synced (issue renamed) for {v}")
 
-        self.issue_cb["values"] = issues
         self.issue_var.set(new)
-        self.on_issue_change()
+        details = list(self.db[v][new].keys())
+        self.detail_var.set("_COMMON" if "_COMMON" in details else (details[0] if details else "_COMMON"))
+        self.refresh_all()
 
     # --------------------------------------------------------
     # UI State
