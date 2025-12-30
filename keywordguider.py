@@ -1,17 +1,19 @@
 # ============================================================
 # Keyword Guide UI POC
 # ------------------------------------------------------------
-# Version: 0.4.3 (2025-12-29)
+# Version: 0.4.4 (2025-12-30)
 #
-# Release Notes (v0.4.3)
+# Release Notes (v0.4.4)
+# - (FIX/UX) Copy Selected NP: placeholder 제거 후 결과가 빈 문자열인 항목은 skip 처리
+# - (UX) refresh_all: Keyword tree refresh 시 selection(checkbox 포함) 복원 후 inline/preview 갱신
+#
+# Existing (v0.4.3 유지)
 # - (UI) Window title에 release version 표시
 # - (FIX) Param in-place edit: selection_set(None) 오류 방지 + selection 복원 공통 패턴화
 # - (UX) Copy 시 parameter 치환 없이 복사하는 기능 추가
 #        - Row Copy: "Copy" / "CopyNP(No Params)"
 #        - Copy Selected: "Copy Selected" / "Copy Selected NP"
 # - (REFAC) refresh 후 selection 복원을 안전하게 처리하는 유틸 추가
-#
-# Existing (v0.4.2 유지)
 # - Keyword에 "Group" 필드
 # - Tree selection bug fix (선택 이벤트에서 tree rebuild 제거)
 # - Keyword Description Rich Text (Bold + 3 Colors) with desc_rich runs
@@ -36,7 +38,7 @@ from tkinter import ttk, messagebox, simpledialog
 # ------------------------------------------------------------
 # Paths / Constants
 # ------------------------------------------------------------
-APP_VERSION = "0.4.3"
+APP_VERSION = "0.4.4"
 
 BASE_DIR = Path(__file__).resolve().parent
 DB_PATH = BASE_DIR / "keywords_db.json"
@@ -873,7 +875,6 @@ class KeywordGuideApp(tk.Tk):
             pass
 
         if valid:
-            # extended selection 유지
             try:
                 self.tree.selection_set(valid[0])
                 for iid in valid[1:]:
@@ -1188,7 +1189,9 @@ class KeywordGuideApp(tk.Tk):
         ttk.Separator(btns, orient="vertical").pack(side=tk.LEFT, fill=tk.Y, padx=10)
 
         ttk.Button(btns, text="Copy Selected", command=self.copy_selected_keywords).pack(side=tk.LEFT, padx=4)
-        ttk.Button(btns, text="Copy Selected NP", command=self.copy_selected_keywords_no_params).pack(side=tk.LEFT, padx=4)
+        ttk.Button(btns, text="Copy Selected NP", command=self.copy_selected_keywords_no_params).pack(
+            side=tk.LEFT, padx=4
+        )
         ttk.Button(btns, text="Reset UI Layout", command=self.reset_ui_layout).pack(side=tk.LEFT, padx=12)
 
         self.inline_box = ttk.LabelFrame(right, text="Inline Parameters (selected keyword placeholders)")
@@ -1286,7 +1289,6 @@ class KeywordGuideApp(tk.Tk):
             if not messagebox.askyesno("Confirm", "Delimiter is empty. Continue?"):
                 return
 
-        # selection 유지
         saved_sel = self._tree_selected_iids_sorted()
         focus = saved_sel[0] if saved_sel else None
 
@@ -1327,9 +1329,15 @@ class KeywordGuideApp(tk.Tk):
     # Refresh
     # --------------------------------------------------------
     def refresh_all(self, *_):
+        # v0.4.4: selection(checkbox 포함) 유지 + inline/preview 갱신
+        saved_sel = self._tree_selected_iids_sorted()
+        focus = saved_sel[0] if saved_sel else None
+
         self.refresh_keywords()
         self.refresh_params()
-        self.clear_inline()
+
+        self._safe_tree_restore_selection(saved_sel, focus_iid=focus)
+        self.on_keyword_select()
 
     def refresh_keywords(self):
         """tree rebuild: 호출하는 쪽에서 selection 백업/복원 패턴을 사용 권장"""
@@ -1542,7 +1550,12 @@ class KeywordGuideApp(tk.Tk):
         rendered_list = []
         for raw_joined in joined_list:
             np = render_keyword_without_params(raw_joined).strip()
-            rendered_list.append(np)
+            if np:  # v0.4.4: 빈 문자열 skip
+                rendered_list.append(np)
+
+        if not rendered_list:
+            self.status_var.set("No valid keywords to copy (NP).")
+            return
 
         combined = delim.join(rendered_list)
         self.clipboard_clear()
@@ -1575,7 +1588,6 @@ class KeywordGuideApp(tk.Tk):
             obj["_keywords"].append(dlg.result)
             self._persist_db("Keyword added")
 
-            # selection 복원: 새 row 선택
             self.refresh_keywords()
             new_iid = str(len(obj["_keywords"]) - 1)
             self._safe_tree_restore_selection([new_iid], focus_iid=new_iid)
@@ -1613,7 +1625,6 @@ class KeywordGuideApp(tk.Tk):
 
         self.refresh_keywords()
 
-        # 삭제 후 selection: 같은 index가 존재하면 그걸, 아니면 마지막
         new_len = len(obj["_keywords"])
         if new_len <= 0:
             self.clear_inline()
@@ -1748,7 +1759,6 @@ class KeywordGuideApp(tk.Tk):
         try:
             vals = list(self.tree.item(row_iid, "values"))
             if len(vals) == len(KEYWORD_COLS):
-                # KEYWORD_COLS: summary, group, info, copy, copynp, preview
                 if which == "copynp":
                     vals[4] = "Copied"
                 else:
@@ -1843,7 +1853,7 @@ class KeywordGuideApp(tk.Tk):
         self.refresh_keyword_previews_only()
 
     # --------------------------------------------------------
-    # Param in-place edit (FIX + selection restore pattern)
+    # Param in-place edit
     # --------------------------------------------------------
     def on_param_cell_double_click(self, event):
         if self._param_editor:
@@ -1878,7 +1888,7 @@ class KeywordGuideApp(tk.Tk):
         if not self._param_editor or not self._param_editing:
             return
 
-        editing_key = self._param_editing  # 로컬 백업
+        editing_key = self._param_editing
         new_val = self._param_editor.get()
 
         obj = self._current_obj()
@@ -1888,7 +1898,6 @@ class KeywordGuideApp(tk.Tk):
         self._cancel_param_edit()
         self.refresh_params()
         self._safe_param_restore_selection(editing_key)
-
         self.refresh_keyword_previews_only()
 
     def _cancel_param_edit(self):
