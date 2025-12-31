@@ -1,37 +1,21 @@
 # ============================================================
 # Keyword Guide UI POC
 # ------------------------------------------------------------
-# Version: 0.5.0 (2025-12-30)
+# Version: 0.5.2 (2025-12-31)
 #
-# Release Notes (v0.5.0)
-# - (UI) 좌측 Vendor/Issue/Detail Category를 Combobox → Tree(Navigation)로 변경
-#        - Tree에서 +/- (expand/collapse)로 숨김/펼침 가능
-#        - 선택 노드에 따라 현재 Vendor/Issue/Detail이 자동 설정됨
-# - (I/O) Export / Import 지원
-#        - Export: 전체 데이터(vendor/issue/detail/keywords/params) + vendor-scoped issue/delimiter config 저장
-#        - Import: Replace ONLY (기존 데이터 완전 교체)
-#          * 실행 전 공지 + Confirm 팝업 표시
-#          * 자동 백업 없음 (사용자가 필요 시 Export로 수동 백업)
+# Release Notes (v0.5.2)
+# - (I/O) 저장 안정성(WinError5 방지): atomic write(tmp->replace) + retry(backoff)
+# - (UI) KeywordDialog 마우스휠 바인딩 부작용 패치: bind_all 제거, 로컬 바인딩만 사용
+# - (UI) KeywordDialog Description 스크롤바 추가
+# - (UX) 로그성 메시지(Log panel) 추가 + 저장/Export/Import 등 이벤트 기록
 #
-# Existing (v0.4.3 유지)
-# - Window title에 release version 표시
-# - Param in-place edit 안정화(selection_set(None) 방지 등)
-# - Copy: params 치환 Copy / No Params(CopyNP)
-# - Keyword "Group" 필드
-# - Keyword Description Rich Text (Bold + 3 Colors) with desc_rich runs
-# - Keyword List: 왼쪽(#0) 체크박스 + extended selection
-# - Select All / Clear All / Copy Selected / Copy Selected NP
-# - Up/Down(단일 선택 1개 기준) 위치 변경
-# - Vendor별 Issue 관리 + Vendor별 Delimiter 저장
-# - Placeholder detect + Inline Apply (category-level params)
-# - UI state persistence
-# - KeywordDialog: Parts fixed height + scroll, Preview wrap+scroll
-# - Import Joined String split UX: confirm
-# - Part 입력 중 delimiter 포함 시 split 제안: confirm(자동 아님)
+# Base: v0.5.0 (2025-12-30)
 # ============================================================
 
 import json
 import re
+import os
+import time
 from pathlib import Path
 from datetime import datetime
 import tkinter as tk
@@ -40,7 +24,7 @@ from tkinter import ttk, messagebox, simpledialog, filedialog
 # ------------------------------------------------------------
 # Paths / Constants
 # ------------------------------------------------------------
-APP_VERSION = "0.5.0"
+APP_VERSION = "0.5.2"
 
 BASE_DIR = Path(__file__).resolve().parent
 DB_PATH = BASE_DIR / "keywords_db.json"
@@ -80,7 +64,7 @@ EXPORT_SCHEMA_VERSION = "1.0"
 
 
 # ------------------------------------------------------------
-# Utility
+# Utility: Safe JSON I/O (WinError 5 방지)
 # ------------------------------------------------------------
 def load_json(path: Path):
     if not path.exists():
@@ -92,8 +76,54 @@ def load_json(path: Path):
         return {}
 
 
+def _safe_atomic_write_text(path: Path, text: str, encoding="utf-8", retries: int = 7):
+    """
+    Windows에서 간헐적으로 발생하는 PermissionError/WinError 5 대응:
+    - tmp 파일에 먼저 write + flush + fsync(가능하면)
+    - os.replace로 원본 교체 (atomic)
+    - 여러 번 retry + backoff
+    """
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    delays = [0.0, 0.03, 0.06, 0.12, 0.25, 0.5, 0.9]  # seconds
+    last_err = None
+
+    for attempt in range(max(1, retries)):
+        tmp_path = None
+        try:
+            suffix = f".tmp.{os.getpid()}.{int(time.time()*1000)}"
+            tmp_path = path.with_name(path.name + suffix)
+
+            with open(tmp_path, "w", encoding=encoding, newline="\n") as f:
+                f.write(text)
+                f.flush()
+                try:
+                    os.fsync(f.fileno())
+                except Exception:
+                    pass
+
+            os.replace(tmp_path, path)
+            return
+
+        except Exception as e:
+            last_err = e
+            try:
+                if tmp_path and tmp_path.exists():
+                    tmp_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+
+            delay = delays[attempt] if attempt < len(delays) else delays[-1]
+            if delay > 0:
+                time.sleep(delay)
+
+    raise last_err
+
+
 def save_json(path: Path, data: dict):
-    path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+    txt = json.dumps(data, indent=2, ensure_ascii=False)
+    _safe_atomic_write_text(path, txt, encoding="utf-8")
 
 
 def detect_placeholders(text: str):
@@ -360,8 +390,9 @@ class KeywordDialog(tk.Toplevel):
         self.parts_container.bind("<Configure>", self._on_parts_container_configure)
         self.parts_canvas.bind("<Configure>", self._on_parts_canvas_configure)
 
-        self._bind_mousewheel(self.parts_canvas)
-        self._bind_mousewheel(self.parts_container)
+        # (PATCH) 마우스휠: bind_all/unbind_all 제거 -> 로컬 바인딩만
+        self._bind_mousewheel_local(self.parts_canvas, target_canvas=self.parts_canvas)
+        self._bind_mousewheel_local(self.parts_container, target_canvas=self.parts_canvas)
 
         add_btn_row = ttk.Frame(frm)
         add_btn_row.grid(row=8, column=0, sticky="w", pady=(0, 8))
@@ -396,8 +427,18 @@ class KeywordDialog(tk.Toplevel):
         ttk.Button(desc_toolbar, text="Red", command=lambda: self._apply_color("red")).pack(side=tk.LEFT, padx=2)
         ttk.Button(desc_toolbar, text="Blue", command=lambda: self._apply_color("blue")).pack(side=tk.LEFT, padx=2)
 
-        self.txt_desc = tk.Text(frm, height=10, wrap="word")
-        self.txt_desc.grid(row=13, column=0, sticky="nsew", pady=(2, 10))
+        # (PATCH) Description: 스크롤바 추가
+        desc_box = ttk.Frame(frm)
+        desc_box.grid(row=13, column=0, sticky="nsew", pady=(2, 10))
+        desc_box.columnconfigure(0, weight=1)
+        desc_box.rowconfigure(0, weight=1)
+
+        self.txt_desc = tk.Text(desc_box, height=10, wrap="word")
+        self.txt_desc.grid(row=0, column=0, sticky="nsew")
+
+        desc_sb = ttk.Scrollbar(desc_box, orient="vertical", command=self.txt_desc.yview)
+        desc_sb.grid(row=0, column=1, sticky="ns", padx=(6, 0))
+        self.txt_desc.configure(yscrollcommand=desc_sb.set)
 
         self.txt_desc.tag_configure("b", font=("TkDefaultFont", 9, "bold"))
         self.txt_desc.tag_configure("c_black", foreground="black")
@@ -451,37 +492,29 @@ class KeywordDialog(tk.Toplevel):
         except Exception:
             pass
 
-    def _bind_mousewheel(self, widget):
-        widget.bind("<Enter>", lambda _e: self._activate_mousewheel(True))
-        widget.bind("<Leave>", lambda _e: self._activate_mousewheel(False))
-
-    def _activate_mousewheel(self, active: bool):
-        if active:
-            self.bind_all("<MouseWheel>", self._on_mousewheel, add="+")
-            self.bind_all("<Button-4>", self._on_mousewheel_linux, add="+")
-            self.bind_all("<Button-5>", self._on_mousewheel_linux, add="+")
-        else:
+    # (PATCH) 로컬 마우스휠 바인딩
+    def _bind_mousewheel_local(self, widget, target_canvas: tk.Canvas):
+        def on_mousewheel(event):
             try:
-                self.unbind_all("<MouseWheel>")
-                self.unbind_all("<Button-4>")
-                self.unbind_all("<Button-5>")
+                delta = int(-1 * (event.delta / 120))
+                target_canvas.yview_scroll(delta, "units")
+                return "break"
             except Exception:
-                pass
+                return None
 
-    def _on_mousewheel(self, event):
-        try:
-            self.parts_canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
-        except Exception:
-            pass
+        def on_mousewheel_linux(event):
+            try:
+                if event.num == 4:
+                    target_canvas.yview_scroll(-1, "units")
+                elif event.num == 5:
+                    target_canvas.yview_scroll(1, "units")
+                return "break"
+            except Exception:
+                return None
 
-    def _on_mousewheel_linux(self, event):
-        try:
-            if event.num == 4:
-                self.parts_canvas.yview_scroll(-1, "units")
-            elif event.num == 5:
-                self.parts_canvas.yview_scroll(1, "units")
-        except Exception:
-            pass
+        widget.bind("<MouseWheel>", on_mousewheel, add="+")
+        widget.bind("<Button-4>", on_mousewheel_linux, add="+")
+        widget.bind("<Button-5>", on_mousewheel_linux, add="+")
 
     def _add_part_row(self, initial_text=""):
         row = ttk.Frame(self.parts_container)
@@ -804,8 +837,19 @@ class InfoPopup(tk.Toplevel):
         txt_kw.configure(state="disabled")
 
         ttk.Label(frm, text="Description").grid(row=6, column=0, sticky="w")
-        txt = tk.Text(frm, wrap="word")
-        txt.grid(row=7, column=0, sticky="nsew")
+
+        # InfoPopup도 길어질 수 있어 스크롤 가능하도록
+        desc_box = ttk.Frame(frm)
+        desc_box.grid(row=7, column=0, sticky="nsew")
+        desc_box.columnconfigure(0, weight=1)
+        desc_box.rowconfigure(0, weight=1)
+
+        txt = tk.Text(desc_box, wrap="word")
+        txt.grid(row=0, column=0, sticky="nsew")
+
+        sb = ttk.Scrollbar(desc_box, orient="vertical", command=txt.yview)
+        sb.grid(row=0, column=1, sticky="ns", padx=(6, 0))
+        txt.configure(yscrollcommand=sb.set)
 
         txt.tag_configure("b", font=("TkDefaultFont", 9, "bold"))
         txt.tag_configure("c_black", foreground="black")
@@ -879,7 +923,7 @@ class KeywordGuideApp(tk.Tk):
         self._copy_feedback_after_id = None
         self._copy_feedback_row = None
 
-        self.geometry(self.ui_state.get("geometry", DEFAULT_GEOMETRY))
+        self.geometry(self.ui_state.get("geometry", DEFAULT_GEOMETRY) if isinstance(self.ui_state, dict) else DEFAULT_GEOMETRY)
         self._build_ui()
         self._make_checkbox_images()
 
@@ -890,6 +934,39 @@ class KeywordGuideApp(tk.Tk):
         self._ensure_current_obj_migrated()
 
         self.protocol("WM_DELETE_WINDOW", self.on_close)
+
+        self.log_info("App started.")
+
+    # --------------------------------------------------------
+    # Logging (NEW)
+    # --------------------------------------------------------
+    def _ts(self):
+        return datetime.now().strftime("%H:%M:%S")
+
+    def _append_log(self, level: str, msg: str):
+        line = f"[{self._ts()}] {level}: {msg}"
+        self.status_var.set(line)
+        try:
+            self.log_text.configure(state="normal")
+            self.log_text.insert("end", line + "\n")
+            self.log_text.see("end")
+            self.log_text.configure(state="disabled")
+        except Exception:
+            pass
+
+        try:
+            print(line)
+        except Exception:
+            pass
+
+    def log_info(self, msg: str):
+        self._append_log("INFO", msg)
+
+    def log_warn(self, msg: str):
+        self._append_log("WARN", msg)
+
+    def log_error(self, msg: str):
+        self._append_log("ERROR", msg)
 
     # --------------------------------------------------------
     # Defaults
@@ -939,16 +1016,16 @@ class KeywordGuideApp(tk.Tk):
         try:
             self.issue_cfg = ensure_issue_config_vendor_scoped(self.issue_cfg, list(self.db.keys()))
             save_json(ISSUES_PATH, self.issue_cfg)
-            self.status_var.set(msg)
+            self.log_info(f"{msg} (saved: {ISSUES_PATH.name})")
         except Exception as e:
-            self.status_var.set(f"Issue config save failed: {e}")
+            self.log_error(f"{msg} FAILED (save {ISSUES_PATH.name}) -> {e}")
 
     def _persist_db(self, msg: str):
         try:
             save_json(DB_PATH, self.db)
-            self.status_var.set(msg)
+            self.log_info(f"{msg} (saved: {DB_PATH.name})")
         except Exception as e:
-            self.status_var.set(f"Save failed: {e}")
+            self.log_error(f"{msg} FAILED (save {DB_PATH.name}) -> {e}")
 
     def _sync_vendor_scoped_config_with_db(self):
         if not isinstance(self.db, dict):
@@ -998,13 +1075,15 @@ class KeywordGuideApp(tk.Tk):
         if changed_cfg:
             try:
                 save_json(ISSUES_PATH, self.issue_cfg)
-            except Exception:
-                pass
+                self.log_info(f"issues_config normalized (saved: {ISSUES_PATH.name})")
+            except Exception as e:
+                self.log_warn(f"issues_config normalize save failed -> {e}")
         if changed_db:
             try:
                 save_json(DB_PATH, self.db)
-            except Exception:
-                pass
+                self.log_info(f"DB normalized (saved: {DB_PATH.name})")
+            except Exception as e:
+                self.log_warn(f"DB normalize save failed -> {e}")
 
     # --------------------------------------------------------
     # UI Build
@@ -1162,8 +1241,22 @@ class KeywordGuideApp(tk.Tk):
         self.param_tree.bind("<Double-1>", self.on_param_cell_double_click)
         self.param_tree.bind("<Button-1>", self._param_editor_cancel_on_click_elsewhere)
 
+        # (NEW) Log panel
+        log_box = ttk.LabelFrame(root, text="Log")
+        log_box.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(10, 0))
+        log_box.columnconfigure(0, weight=1)
+
+        self.log_text = tk.Text(log_box, height=6, wrap="none")
+        self.log_text.grid(row=0, column=0, sticky="ew", padx=(8, 0), pady=8)
+        self.log_text.configure(state="disabled")
+
+        log_sb = ttk.Scrollbar(log_box, orient="vertical", command=self.log_text.yview)
+        log_sb.grid(row=0, column=1, sticky="ns", padx=(8, 8), pady=8)
+        self.log_text.configure(yscrollcommand=log_sb.set)
+
+        # status bar
         status = ttk.Frame(root)
-        status.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(10, 0))
+        status.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(6, 0))
         ttk.Label(status, textvariable=self.status_var).pack(side=tk.LEFT)
 
         root.columnconfigure(1, weight=1)
@@ -1186,7 +1279,6 @@ class KeywordGuideApp(tk.Tk):
         return f"d|{v}|{i}|{d}"
 
     def _parse_nav_iid(self, iid: str):
-        # returns (kind, vendor, issue, detail)
         try:
             parts = iid.split("|")
             kind = parts[0]
@@ -1200,18 +1292,13 @@ class KeywordGuideApp(tk.Tk):
             pass
         return "", "", "", ""
 
-    def _nav_path(self):
-        return (self.vendor_var.get(), self.issue_var.get(), self.detail_var.get())
-
     def build_nav_tree(self, select_default=True, restore_path=None):
-        """Rebuild full navigation tree (vendors/issues/details). Optionally restore selection."""
         self.nav_tree.delete(*self.nav_tree.get_children(""))
         vendors = list(self.db.keys()) if isinstance(self.db, dict) else []
         if not vendors:
             self.db = self._default_db()
             vendors = list(self.db.keys())
 
-        # normalize cfg with vendors
         self.issue_cfg = ensure_issue_config_vendor_scoped(self.issue_cfg, vendors)
 
         for v in vendors:
@@ -1219,7 +1306,6 @@ class KeywordGuideApp(tk.Tk):
             self.nav_tree.insert("", "end", iid=vid, text=v, open=True)
 
             issues = self._get_vendor_issues(v)
-            # fallback to db keys if config empty
             if not issues and isinstance(self.db.get(v), dict):
                 issues = list(self.db[v].keys())
             for issue in issues:
@@ -1229,7 +1315,6 @@ class KeywordGuideApp(tk.Tk):
                 self.db.setdefault(v, {})
                 self.db[v].setdefault(issue, self._default_issue_obj())
                 details = list(self.db[v][issue].keys())
-                # keep _COMMON first if exists
                 if "_COMMON" in details:
                     details = ["_COMMON"] + [x for x in details if x != "_COMMON"]
 
@@ -1237,7 +1322,6 @@ class KeywordGuideApp(tk.Tk):
                     did = self._nav_iid_detail(v, issue, d)
                     self.nav_tree.insert(iid, "end", iid=did, text=d, open=False)
 
-        # restore selection
         if restore_path:
             v, i, d = restore_path
             target = None
@@ -1263,28 +1347,25 @@ class KeywordGuideApp(tk.Tk):
                 except Exception:
                     pass
 
-        if select_default:
-            # choose first vendor/issue/_COMMON
-            if vendors:
-                v = vendors[0]
-                issues = self._get_vendor_issues(v)
-                if not issues:
-                    issues = list(self.db.get(v, {}).keys())
-                if issues:
-                    i = issues[0]
-                    d = "_COMMON" if "_COMMON" in self.db[v][i] else (list(self.db[v][i].keys())[0] if self.db[v][i] else "_COMMON")
-                    target = self._nav_iid_detail(v, i, d)
-                    if not self.nav_tree.exists(target):
-                        target = self._nav_iid_issue(v, i)
-                    try:
-                        self.nav_tree.selection_set(target)
-                        self.nav_tree.see(target)
-                        self._apply_nav_selection(target)
-                    except Exception:
-                        pass
+        if select_default and vendors:
+            v = vendors[0]
+            issues = self._get_vendor_issues(v)
+            if not issues:
+                issues = list(self.db.get(v, {}).keys())
+            if issues:
+                i = issues[0]
+                d = "_COMMON" if "_COMMON" in self.db[v][i] else (list(self.db[v][i].keys())[0] if self.db[v][i] else "_COMMON")
+                target = self._nav_iid_detail(v, i, d)
+                if not self.nav_tree.exists(target):
+                    target = self._nav_iid_issue(v, i)
+                try:
+                    self.nav_tree.selection_set(target)
+                    self.nav_tree.see(target)
+                    self._apply_nav_selection(target)
+                except Exception:
+                    pass
 
     def _init_nav_default_selection(self):
-        # try restore from ui_state path
         restore = None
         if isinstance(self.ui_state, dict):
             p = self.ui_state.get("nav_path", None)
@@ -1303,7 +1384,6 @@ class KeywordGuideApp(tk.Tk):
         if not kind:
             return
 
-        # If vendor node selected -> try keep previous issue/detail if exists else first
         if kind == "v":
             self.vendor_var.set(v)
             self.delim_var.set(self._get_vendor_delimiter(v))
@@ -1318,7 +1398,6 @@ class KeywordGuideApp(tk.Tk):
             else:
                 self.issue_var.set(issues[0] if issues else "")
 
-            # choose detail
             issue = self.issue_var.get()
             details = list(self.db.get(v, {}).get(issue, {}).keys())
             if "_COMMON" in details:
@@ -1343,7 +1422,6 @@ class KeywordGuideApp(tk.Tk):
             self.detail_var.set(d)
             self.delim_var.set(self._get_vendor_delimiter(v))
 
-        # ensure existence and refresh
         self._ensure_path_exists(v, self.issue_var.get(), self.detail_var.get())
         self.refresh_all()
 
@@ -1353,7 +1431,6 @@ class KeywordGuideApp(tk.Tk):
         self.db.setdefault(v, {})
         self.db[v].setdefault(i, self._default_issue_obj())
         self.db[v][i].setdefault(d, {"_keywords": [], "_params": {}})
-        # normalize cfg vs db
         self._sync_vendor_scoped_config_with_db()
 
     # --------------------------------------------------------
@@ -1486,7 +1563,7 @@ class KeywordGuideApp(tk.Tk):
         self.clear_inline()
 
         v, i, d = self.vendor_var.get(), self.issue_var.get(), self.detail_var.get()
-        self.status_var.set(f"Selected: {v} > {i} > {d}")
+        self.log_info(f"Selected: {v} > {i} > {d}")
 
     def refresh_keywords(self):
         self._clear_copy_feedback(force=True)
@@ -1627,7 +1704,6 @@ class KeywordGuideApp(tk.Tk):
         self._safe_tree_restore_selection(saved_sel, focus_iid=focus)
         self.on_keyword_select()
 
-        # nav display doesn't change, but keep cfg/db aligned
         self._sync_vendor_scoped_config_with_db()
 
     # --------------------------------------------------------
@@ -1639,12 +1715,12 @@ class KeywordGuideApp(tk.Tk):
             return
         self.tree.selection_set(kids)
         self._sync_checkboxes_with_selection()
-        self.status_var.set(f"Selected all ({len(kids)})")
+        self.log_info(f"Selected all ({len(kids)})")
 
     def clear_all_keywords_selection(self):
         self.tree.selection_remove(self.tree.selection())
         self._sync_checkboxes_with_selection()
-        self.status_var.set("Cleared all selections")
+        self.log_info("Cleared all selections")
 
     # --------------------------------------------------------
     # Bulk copy selected keywords
@@ -1681,7 +1757,7 @@ class KeywordGuideApp(tk.Tk):
     def copy_selected_keywords(self, _event=None):
         joined_list = self._collect_selected_joined_templates()
         if not joined_list:
-            self.status_var.set("No selection to copy.")
+            self.log_warn("No selection to copy.")
             return
 
         obj = self._current_obj()
@@ -1696,18 +1772,18 @@ class KeywordGuideApp(tk.Tk):
                 rendered_list.append(rendered)
 
         if not rendered_list:
-            self.status_var.set("No valid keywords to copy.")
+            self.log_warn("No valid keywords to copy.")
             return
 
         combined = delim.join(rendered_list)
         self.clipboard_clear()
         self.clipboard_append(combined)
-        self.status_var.set(f"Copied Selected ({len(rendered_list)}): {combined}")
+        self.log_info(f"Copied Selected ({len(rendered_list)}): {combined}")
 
     def copy_selected_keywords_no_params(self):
         joined_list = self._collect_selected_joined_templates()
         if not joined_list:
-            self.status_var.set("No selection to copy.")
+            self.log_warn("No selection to copy.")
             return
 
         v = self.vendor_var.get()
@@ -1721,7 +1797,7 @@ class KeywordGuideApp(tk.Tk):
         combined = delim.join(rendered_list)
         self.clipboard_clear()
         self.clipboard_append(combined)
-        self.status_var.set(f"Copied Selected NP ({len(rendered_list)}): {combined}")
+        self.log_info(f"Copied Selected NP ({len(rendered_list)}): {combined}")
 
     # --------------------------------------------------------
     # Keyword CRUD
@@ -1804,7 +1880,7 @@ class KeywordGuideApp(tk.Tk):
         if not sel:
             return
         if len(sel) != 1:
-            self.status_var.set("Up/Down은 단일 선택 1개에서만 동작합니다.")
+            self.log_warn("Up/Down은 단일 선택 1개에서만 동작합니다.")
             return
 
         try:
@@ -1830,7 +1906,7 @@ class KeywordGuideApp(tk.Tk):
         if not sel:
             return
         if len(sel) != 1:
-            self.status_var.set("Up/Down은 단일 선택 1개에서만 동작합니다.")
+            self.log_warn("Up/Down은 단일 선택 1개에서만 동작합니다.")
             return
 
         try:
@@ -1897,14 +1973,14 @@ class KeywordGuideApp(tk.Tk):
             self.clipboard_clear()
             self.clipboard_append(rendered)
             self._show_copy_feedback(row, which="copy")
-            self.status_var.set(f"Copied: {rendered}")
+            self.log_info(f"Copied: {rendered}")
 
         elif col == "#5":  # CopyNP (without params)
             rendered = render_keyword_without_params(raw_joined)
             self.clipboard_clear()
             self.clipboard_append(rendered)
             self._show_copy_feedback(row, which="copynp")
-            self.status_var.set(f"Copied NP: {rendered}")
+            self.log_info(f"Copied NP: {rendered}")
 
     def on_tree_double_click(self, event):
         col = self.tree.identify_column(event.x)
@@ -2060,7 +2136,6 @@ class KeywordGuideApp(tk.Tk):
         self._cancel_param_edit()
         self.refresh_params()
         self._safe_param_restore_selection(editing_key)
-
         self.refresh_keyword_previews_only()
 
     def _cancel_param_edit(self):
@@ -2102,7 +2177,6 @@ class KeywordGuideApp(tk.Tk):
         self.db[v][i][name] = {"_keywords": [], "_params": {}}
         self._persist_db("Category added")
 
-        # rebuild nav and select new detail
         restore = (v, i, name)
         self.build_nav_tree(select_default=True, restore_path=restore)
 
@@ -2122,7 +2196,6 @@ class KeywordGuideApp(tk.Tk):
             return
         self._persist_db("Category deleted")
 
-        # choose next detail
         details = list(self.db[v][i].keys())
         new_d = "_COMMON" if "_COMMON" in details else (details[0] if details else "_COMMON")
         self.build_nav_tree(select_default=True, restore_path=(v, i, new_d))
@@ -2208,7 +2281,6 @@ class KeywordGuideApp(tk.Tk):
             del self.db[v][cur]
         self._persist_db(f"DB synced (issue deleted) for {v}")
 
-        # select first remaining issue
         new_issue = issues[0]
         self.build_nav_tree(select_default=True, restore_path=(v, new_issue, "_COMMON"))
 
@@ -2265,9 +2337,11 @@ class KeywordGuideApp(tk.Tk):
             return
 
         try:
-            Path(path).write_text(json.dumps(pkg, indent=2, ensure_ascii=False), encoding="utf-8")
-            self.status_var.set(f"Exported: {path}")
+            txt = json.dumps(pkg, indent=2, ensure_ascii=False)
+            _safe_atomic_write_text(Path(path), txt, encoding="utf-8")
+            self.log_info(f"Exported: {path}")
         except Exception as e:
+            self.log_error(f"Export Failed: {e}")
             messagebox.showerror("Export Failed", str(e))
 
     def _load_import_file(self) -> dict | None:
@@ -2282,11 +2356,13 @@ class KeywordGuideApp(tk.Tk):
             txt = Path(path).read_text(encoding="utf-8")
             pkg = json.loads(txt)
         except Exception as e:
+            self.log_error(f"Import read/parse error: {e}")
             messagebox.showerror("Import Failed", f"File read/parse error:\n{e}")
             return None
 
         ok, msg = validate_import_package(pkg)
         if not ok:
+            self.log_error(f"Import invalid package: {msg}")
             messagebox.showerror("Import Failed", msg)
             return None
 
@@ -2300,7 +2376,6 @@ class KeywordGuideApp(tk.Tk):
 
         path = pkg.get("_import_path", "")
 
-        # 공지 + Confirm
         notice = (
             "IMPORT (REPLACE) 안내\n\n"
             "이 작업은 현재 앱의 DB/설정 데이터를 IMPORT 파일로 '완전 교체'합니다.\n"
@@ -2310,7 +2385,7 @@ class KeywordGuideApp(tk.Tk):
             "계속 진행할까요?"
         )
         if not messagebox.askyesno("Confirm Import (Replace)", notice):
-            self.status_var.set("Import cancelled.")
+            self.log_info("Import cancelled.")
             return
 
         try:
@@ -2327,21 +2402,19 @@ class KeywordGuideApp(tk.Tk):
             if isinstance(new_ui, dict) and new_ui:
                 self.ui_state = new_ui
 
-            # normalize/align
             self._sync_vendor_scoped_config_with_db()
 
-            # persist
             save_json(DB_PATH, self.db)
             save_json(ISSUES_PATH, self.issue_cfg)
             if isinstance(self.ui_state, dict):
                 save_json(UI_STATE_PATH, self.ui_state)
 
-            # rebuild UI
             self._apply_saved_widths()
             self.build_nav_tree(select_default=True, restore_path=None)
             self.refresh_all()
-            self.status_var.set(f"Imported (Replace): {path}")
+            self.log_info(f"Imported (Replace): {path}")
         except Exception as e:
+            self.log_error(f"Import Failed: {e}")
             messagebox.showerror("Import Failed", str(e))
 
     # --------------------------------------------------------
@@ -2381,7 +2454,7 @@ class KeywordGuideApp(tk.Tk):
             pass
         for c, w in DEFAULT_PARAM_COL_WIDTHS.items():
             self.param_tree.column(c, width=w)
-        self.status_var.set("UI layout reset to defaults.")
+        self.log_info("UI layout reset to defaults.")
 
     def on_close(self):
         nav_path = {"vendor": self.vendor_var.get(), "issue": self.issue_var.get(), "detail": self.detail_var.get()}
@@ -2393,8 +2466,19 @@ class KeywordGuideApp(tk.Tk):
             "keyword_tree_cols": {c: self.tree.column(c, "width") for c in KEYWORD_COLS},
             "param_tree_cols": {c: self.param_tree.column(c, "width") for c in DEFAULT_PARAM_COL_WIDTHS},
         }
-        save_json(UI_STATE_PATH, state)
-        save_json(DB_PATH, self.db)
+
+        try:
+            save_json(UI_STATE_PATH, state)
+            self.log_info(f"UI state saved: {UI_STATE_PATH.name}")
+        except Exception as e:
+            self.log_error(f"UI state save FAILED -> {e}")
+
+        try:
+            save_json(DB_PATH, self.db)
+            self.log_info(f"DB saved: {DB_PATH.name}")
+        except Exception as e:
+            self.log_error(f"DB save FAILED -> {e}")
+
         self._persist_issues("Issue config saved")
         self.destroy()
 
