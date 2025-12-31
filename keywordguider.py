@@ -2669,4 +2669,64 @@ class KeywordGuideApp(tk.Tk):
     # UI State
     # --------------------------------------------------------
     def _apply_saved_widths(self):
-        cols = self.ui_state.get("
+        cols = self.ui_state.get("keyword_tree_cols", {}) if isinstance(self.ui_state, dict) else {}
+        for c, w in cols.items():
+            if c in DEFAULT_KEYWORD_COL_WIDTHS and c in KEYWORD_COLS:
+                try:
+                    self.tree.column(c, width=int(w))
+                except Exception:
+                    pass
+
+        try:
+            w0 = (self.ui_state.get("keyword_tree_col0_width", 34) if isinstance(self.ui_state, dict) else 34)
+            self.tree.column("#0", width=int(w0))
+        except Exception:
+            pass
+
+        pcols = self.ui_state.get("param_tree_cols", {}) if isinstance(self.ui_state, dict) else {}
+        for c, w in pcols.items():
+            if c in DEFAULT_PARAM_COL_WIDTHS:
+                try:
+                    self.param_tree.column(c, width=int(w))
+                except Exception:
+                    pass
+
+    def reset_ui_layout(self):
+        self.geometry(DEFAULT_GEOMETRY)
+        for c, w in DEFAULT_KEYWORD_COL_WIDTHS.items():
+            if c in KEYWORD_COLS:
+                self.tree.column(c, width=w)
+        try:
+            self.tree.column("#0", width=34)
+        except Exception:
+            pass
+        for c, w in DEFAULT_PARAM_COL_WIDTHS.items():
+            self.param_tree.column(c, width=w)
+        self.log("UI layout reset to defaults.")
+
+    def on_close(self):
+        self._store_nav_open_state()
+        open_iids = self.ui_state.get("nav_open_iids", []) if isinstance(self.ui_state, dict) else []
+
+        nav_path = {"vendor": self.vendor_var.get(), "issue": self.issue_var.get(), "detail": self.detail_var.get()}
+
+        state = {
+            "geometry": self.geometry(),
+            "nav_path": nav_path,
+            "nav_open_iids": open_iids,
+            "keyword_tree_col0_width": self.tree.column("#0", "width"),
+            "keyword_tree_cols": {c: self.tree.column(c, "width") for c in KEYWORD_COLS},
+            "param_tree_cols": {c: self.param_tree.column(c, "width") for c in DEFAULT_PARAM_COL_WIDTHS},
+        }
+
+        self._persist_ui_state("UI state saved", state)
+        self._persist_db("DB saved")
+        self._persist_issues("Issue config saved")
+        self.destroy()
+
+
+if __name__ == "__main__":
+    try:
+        KeywordGuideApp().mainloop()
+    except Exception:
+        print("Fatal error:\n", traceback.format_exc())
