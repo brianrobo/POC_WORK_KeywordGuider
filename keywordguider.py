@@ -1,29 +1,19 @@
 # ============================================================
 # Keyword Guide UI POC
 # ------------------------------------------------------------
-# Version: 0.5.4 (2025-12-31)
+# Version: 0.5.5 (2025-12-31)
 #
-# Release Notes (v0.5.4)
-# - (FIX) Navigation Tree 펼침/접힘 상태가 앱 재실행 후 유지되지 않던 문제 수정
-#        - build_nav_tree()에서 open=True 강제 적용 제거
-#        - ui_state.json에 nav_open_iids 저장/복원
-#        - 선택된 노드가 보이도록 “선택 경로 조상만” 최소 open 처리(사용자 open 상태는 그대로 유지)
-# - (I/O) 저장 안정성(WinError 5 방지) 적용
-#        - JSON 저장 시 tmp -> os.replace + retry/backoff
-#        - 실패 시 autosave 파일로 fallback 저장
-# - (UI) KeywordDialog: 마우스휠 바인딩 부작용(전체 bind_all/unbind_all) 제거
-#        - parts_canvas에만 wheel 이벤트 바인딩(플랫폼별 처리)
-# - (UI) KeywordDialog: Description 영역에 스크롤바 추가(내용 길어도 스크롤 가능)
-# - (LOG) 간단한 로그 패널 추가(시간 포함 메시지 누적) + status bar 연동
-#
-# Existing (v0.5.0 유지)
-# - Navigation Tree (Vendor/Issue/Detail)
-# - Export / Import (Replace ONLY)
-# - Copy / CopyNP, Bulk copy, Checkbox + extended selection
-# - Up/Down(단일 선택 1개) 위치 변경
-# - Keyword Group, Desc rich(Bold + 3 colors), Parts UI + preview wrap/scroll
-# - Placeholder detect + Inline Apply (category-level params)
-# - UI state persistence
+# Release Notes (v0.5.5)
+# - (FEATURE) Vendor CRUD 지원 (+ Vendor / - Vendor / R Vendor)
+#        - Vendor도 동적으로 추가/삭제/이름변경 가능
+#        - 정책 A 적용: 새 Vendor 생성 시 기본 Issue 2개(데이터 이슈/망등록 이슈) 자동 생성
+#        - vendor 삭제 시 해당 vendor의 모든 issue/category/keywords/params 함께 삭제
+#        - vendor rename 시 db 및 vendor-scoped issue_cfg 함께 rename
+# - (KEEP) v0.5.4 기능 유지
+#        - Navigation Tree open/close 상태 저장/복원
+#        - 저장 안정성(WinError 5 방지): tmp -> os.replace + retry/backoff + autosave fallback
+#        - KeywordDialog: parts canvas wheel binding 부작용 제거 + description scrollbar + preview wrap/scroll
+#        - Log panel + status bar 연동
 # ============================================================
 
 import json
@@ -40,7 +30,7 @@ from tkinter.scrolledtext import ScrolledText
 # ------------------------------------------------------------
 # Paths / Constants
 # ------------------------------------------------------------
-APP_VERSION = "0.5.4"
+APP_VERSION = "0.5.5"
 
 BASE_DIR = Path(__file__).resolve().parent
 DB_PATH = BASE_DIR / "keywords_db.json"
@@ -104,7 +94,6 @@ def _safe_write_json(path: Path, data: dict, retries: int = 7, base_sleep: float
             return True, "OK"
         except PermissionError as e:
             last_err = e
-            # backoff
             time.sleep(base_sleep * (1.6 ** n))
             continue
         except Exception as e:
@@ -112,7 +101,6 @@ def _safe_write_json(path: Path, data: dict, retries: int = 7, base_sleep: float
             time.sleep(base_sleep * (1.4 ** n))
             continue
 
-    # fallback autosave
     try:
         autosave.write_text(txt, encoding="utf-8")
         return False, f"Primary save failed ({last_err}); wrote fallback: {autosave.name}"
@@ -510,17 +498,13 @@ class KeywordDialog(tk.Toplevel):
 
     # -------- mouse wheel (no global bind_all) --------
     def _bind_mousewheel_to_canvas(self, canvas: tk.Canvas):
-        # Windows / macOS
         canvas.bind("<MouseWheel>", self._on_mousewheel_windows_mac, add="+")
-        # Linux
         canvas.bind("<Button-4>", self._on_mousewheel_linux, add="+")
         canvas.bind("<Button-5>", self._on_mousewheel_linux, add="+")
-        # Trackpad (mac sometimes uses Shift+MouseWheel variants)
         canvas.bind("<Shift-MouseWheel>", self._on_mousewheel_windows_mac, add="+")
 
     def _on_mousewheel_windows_mac(self, event):
         try:
-            # event.delta: Windows 120 step, macOS can be small deltas
             delta = event.delta
             if delta == 0:
                 return
@@ -1129,7 +1113,7 @@ class KeywordGuideApp(tk.Tk):
 
         self.nav_tree.bind("<<TreeviewSelect>>", self.on_nav_select)
 
-        # track open/close to keep in-memory set (optional but helps)
+        # track open/close to keep in-memory set
         self.nav_tree.bind("<<TreeviewOpen>>", self._on_nav_open_close)
         self.nav_tree.bind("<<TreeviewClose>>", self._on_nav_open_close)
 
@@ -1141,12 +1125,19 @@ class KeywordGuideApp(tk.Tk):
         self.delim_entry.pack(side=tk.LEFT, padx=(0, 6))
         ttk.Button(delim_row, text="Apply", command=self.apply_vendor_delimiter).pack(side=tk.LEFT)
 
-        # Issue / Category CRUD (acts on current selection)
+        # CRUD
         crud = ttk.LabelFrame(left, text="CRUD (Selected Node)")
         crud.pack(fill=tk.X, pady=(10, 0))
 
+        # (NEW) Vendor CRUD
+        btn_row0 = ttk.Frame(crud)
+        btn_row0.pack(fill=tk.X, padx=6, pady=(6, 2))
+        ttk.Button(btn_row0, text="+ Vendor", command=self.add_vendor).pack(side=tk.LEFT, padx=3)
+        ttk.Button(btn_row0, text="- Vendor", command=self.delete_vendor).pack(side=tk.LEFT, padx=3)
+        ttk.Button(btn_row0, text="R Vendor", command=self.rename_vendor).pack(side=tk.LEFT, padx=3)
+
         btn_row1 = ttk.Frame(crud)
-        btn_row1.pack(fill=tk.X, padx=6, pady=(6, 2))
+        btn_row1.pack(fill=tk.X, padx=6, pady=(2, 2))
         ttk.Button(btn_row1, text="+ Issue", command=self.add_issue).pack(side=tk.LEFT, padx=3)
         ttk.Button(btn_row1, text="- Issue", command=self.delete_issue).pack(side=tk.LEFT, padx=3)
         ttk.Button(btn_row1, text="R Issue", command=self.rename_issue).pack(side=tk.LEFT, padx=3)
@@ -1291,7 +1282,6 @@ class KeywordGuideApp(tk.Tk):
         return f"d|{v}|{i}|{d}"
 
     def _parse_nav_iid(self, iid: str):
-        # returns (kind, vendor, issue, detail)
         try:
             parts = iid.split("|")
             kind = parts[0]
@@ -1306,7 +1296,6 @@ class KeywordGuideApp(tk.Tk):
         return "", "", "", ""
 
     def _open_ancestors(self, iid: str):
-        """선택 노드가 보이도록 부모 체인만 open=True로 만든다."""
         try:
             cur = iid
             while cur:
@@ -1319,7 +1308,6 @@ class KeywordGuideApp(tk.Tk):
             pass
 
     def _store_nav_open_state(self):
-        """현재 nav_tree에서 open=True인 iid를 ui_state에 반영"""
         open_ids = []
 
         def walk(node=""):
@@ -1342,7 +1330,6 @@ class KeywordGuideApp(tk.Tk):
         self._nav_open_set = set(open_ids)
 
     def _restore_nav_open_state(self):
-        """ui_state의 nav_open_iids를 nav_tree에 적용"""
         open_ids = []
         if isinstance(self.ui_state, dict):
             open_ids = self.ui_state.get("nav_open_iids", [])
@@ -1358,7 +1345,6 @@ class KeywordGuideApp(tk.Tk):
                 pass
 
     def _on_nav_open_close(self, _event=None):
-        """사용자가 열고 닫을 때 in-memory set 업데이트 (종료 저장 시에도 사용)"""
         try:
             sel = self.nav_tree.focus()
             if not sel:
@@ -1373,11 +1359,6 @@ class KeywordGuideApp(tk.Tk):
             pass
 
     def build_nav_tree(self, select_default=True, restore_path=None):
-        """
-        Rebuild full navigation tree (vendors/issues/details).
-        - open 상태는 insert에서 강제하지 않고, build 후 restore_nav_open_state()로만 복원
-        """
-        # cache current open state before rebuild (optional but good)
         try:
             self._store_nav_open_state()
         except Exception:
@@ -1393,7 +1374,6 @@ class KeywordGuideApp(tk.Tk):
 
         for v in vendors:
             vid = self._nav_iid_vendor(v)
-            # (FIX) open=True 강제 제거
             self.nav_tree.insert("", "end", iid=vid, text=v, open=False)
 
             issues = self._get_vendor_issues(v)
@@ -1401,7 +1381,6 @@ class KeywordGuideApp(tk.Tk):
                 issues = list(self.db[v].keys())
             for issue in issues:
                 iid = self._nav_iid_issue(v, issue)
-                # (FIX) open=True 강제 제거
                 self.nav_tree.insert(vid, "end", iid=iid, text=issue, open=False)
 
                 self.db.setdefault(v, {})
@@ -1414,10 +1393,8 @@ class KeywordGuideApp(tk.Tk):
                     did = self._nav_iid_detail(v, issue, d)
                     self.nav_tree.insert(iid, "end", iid=did, text=d, open=False)
 
-        # (FIX) build 끝난 뒤 open 상태 복원
         self._restore_nav_open_state()
 
-        # restore selection
         if restore_path:
             v, i, d = restore_path
             target = None
@@ -1436,7 +1413,6 @@ class KeywordGuideApp(tk.Tk):
 
             if target:
                 try:
-                    # 선택 노드 보이게 조상만 open (A 방식 훼손하지 않음)
                     self._open_ancestors(target)
                     self.nav_tree.selection_set(target)
                     self.nav_tree.see(target)
@@ -1472,7 +1448,6 @@ class KeywordGuideApp(tk.Tk):
             if isinstance(p, dict):
                 restore = (p.get("vendor", ""), p.get("issue", ""), p.get("detail", ""))
 
-        # preload nav open state from ui_state
         if isinstance(self.ui_state, dict):
             o = self.ui_state.get("nav_open_iids", [])
             if isinstance(o, list):
@@ -2063,7 +2038,6 @@ class KeywordGuideApp(tk.Tk):
         delim = self._get_vendor_delimiter(v)
         raw_joined = keyword_joined_template(kw, delim)
 
-        # columns: #0 checkbox, #1 summary, #2 group, #3 info, #4 copy, #5 copynp, #6 preview
         if col == "#3":  # Info
             InfoPopup(
                 self,
@@ -2243,7 +2217,6 @@ class KeywordGuideApp(tk.Tk):
         self._cancel_param_edit()
         self.refresh_params()
         self._safe_param_restore_selection(editing_key)
-
         self.refresh_keyword_previews_only()
 
     def _cancel_param_edit(self):
@@ -2331,6 +2304,178 @@ class KeywordGuideApp(tk.Tk):
         self._persist_db("Category renamed")
 
         self.build_nav_tree(select_default=True, restore_path=(v, i, new))
+
+    # --------------------------------------------------------
+    # Vendor CRUD (NEW)
+    # --------------------------------------------------------
+    def add_vendor(self):
+        name = simpledialog.askstring("Add Vendor", "Vendor name (e.g., QCOM):")
+        if not name:
+            return
+        name = name.strip()
+        if not name:
+            return
+
+        if not isinstance(self.db, dict):
+            self.db = self._default_db()
+
+        if name in self.db:
+            messagebox.showwarning("Warning", "Vendor already exists.")
+            return
+
+        # 정책 A: 새 Vendor 생성 시 기본 Issue 2개 자동 생성
+        base_issues = default_issues()
+
+        self.db[name] = {}
+        for issue in base_issues:
+            self.db[name][issue] = self._default_issue_obj()
+
+        # vendor-scoped issue_cfg entry 생성
+        self.issue_cfg = ensure_issue_config_vendor_scoped(self.issue_cfg, list(self.db.keys()))
+        self._set_vendor_issues(name, list(base_issues))
+        self._set_vendor_delimiter(name, DEFAULT_DELIMITER)
+
+        self._persist_db(f"Vendor added: {name}")
+        self._persist_issues(f"Vendor config added: {name}")
+
+        self._sync_vendor_scoped_config_with_db()
+        self.build_nav_tree(select_default=True, restore_path=(name, base_issues[0], "_COMMON"))
+        self.log(f"Vendor added: {name}")
+
+    def delete_vendor(self):
+        v = self.vendor_var.get()
+        if not v:
+            messagebox.showinfo("Info", "Vendor를 먼저 선택하세요.")
+            return
+
+        vendors = list(self.db.keys()) if isinstance(self.db, dict) else []
+        if len(vendors) <= 1:
+            messagebox.showinfo("Info", "At least one vendor must remain.")
+            return
+
+        notice = (
+            f"Delete vendor '{v}'?\n\n"
+            "- 해당 vendor의 모든 Issue/Category/Keyword/Param 데이터가 삭제됩니다.\n"
+            "- 자동 백업은 없습니다. 필요하면 먼저 Export 하세요."
+        )
+        if not messagebox.askyesno("Confirm", notice):
+            return
+
+        try:
+            if isinstance(self.db, dict) and v in self.db:
+                del self.db[v]
+        except Exception:
+            return
+
+        try:
+            if isinstance(self.issue_cfg, dict):
+                vo = self.issue_cfg.get("vendors", {})
+                if isinstance(vo, dict) and v in vo:
+                    del vo[v]
+        except Exception:
+            pass
+
+        # UI open-state 중 삭제된 vendor 관련 iid가 남아있을 수 있으니 정규화 (exists 체크로도 보호되지만 정리)
+        try:
+            if isinstance(self.ui_state, dict):
+                o = self.ui_state.get("nav_open_iids", [])
+                if isinstance(o, list):
+                    self.ui_state["nav_open_iids"] = [x for x in o if (not str(x).startswith(f"v|{v}")) and (f"|{v}|" not in str(x))]
+        except Exception:
+            pass
+
+        self.issue_cfg = ensure_issue_config_vendor_scoped(self.issue_cfg, list(self.db.keys()))
+        self._persist_db(f"Vendor deleted: {v}")
+        self._persist_issues(f"Vendor config deleted: {v}")
+
+        new_vendors = list(self.db.keys())
+        nv = new_vendors[0] if new_vendors else ""
+        ni_list = self._get_vendor_issues(nv) if nv else []
+        ni = ni_list[0] if ni_list else (list(self.db.get(nv, {}).keys())[0] if nv and isinstance(self.db.get(nv), dict) and self.db[nv] else "")
+        self._sync_vendor_scoped_config_with_db()
+        self.build_nav_tree(select_default=True, restore_path=(nv, ni, "_COMMON"))
+        self.log(f"Vendor deleted: {v}")
+
+    def rename_vendor(self):
+        v = self.vendor_var.get()
+        if not v:
+            messagebox.showinfo("Info", "Vendor를 먼저 선택하세요.")
+            return
+
+        new = simpledialog.askstring("Rename Vendor", "New vendor name:", initialvalue=v)
+        if not new:
+            return
+        new = new.strip()
+        if not new or new == v:
+            return
+
+        if not isinstance(self.db, dict):
+            self.db = self._default_db()
+
+        if new in self.db:
+            messagebox.showwarning("Warning", "Vendor name already exists.")
+            return
+
+        # DB key rename
+        try:
+            self.db[new] = self.db.pop(v)
+        except Exception as e:
+            messagebox.showerror("Error", f"Rename failed: {e}")
+            return
+
+        # issue_cfg vendor key rename
+        try:
+            self.issue_cfg.setdefault("vendors", {})
+            if v in self.issue_cfg["vendors"]:
+                self.issue_cfg["vendors"][new] = self.issue_cfg["vendors"].pop(v)
+            else:
+                self.issue_cfg["vendors"][new] = {"issues": default_issues(), "delimiter": DEFAULT_DELIMITER}
+        except Exception:
+            pass
+
+        # UI open-state 및 last path도 일부 갱신해두면 좋음 (exists 체크로도 보호되지만, UX 정리)
+        try:
+            if isinstance(self.ui_state, dict):
+                o = self.ui_state.get("nav_open_iids", [])
+                if isinstance(o, list) and o:
+                    replaced = []
+                    for x in o:
+                        sx = str(x)
+                        # iid 포맷: v|V / i|V|I / d|V|I|D
+                        if sx == f"v|{v}":
+                            replaced.append(f"v|{new}")
+                        elif sx.startswith(f"i|{v}|"):
+                            replaced.append(sx.replace(f"i|{v}|", f"i|{new}|", 1))
+                        elif sx.startswith(f"d|{v}|"):
+                            replaced.append(sx.replace(f"d|{v}|", f"d|{new}|", 1))
+                        else:
+                            replaced.append(sx)
+                    self.ui_state["nav_open_iids"] = replaced
+
+                p = self.ui_state.get("nav_path", None)
+                if isinstance(p, dict) and p.get("vendor") == v:
+                    p["vendor"] = new
+        except Exception:
+            pass
+
+        self.issue_cfg = ensure_issue_config_vendor_scoped(self.issue_cfg, list(self.db.keys()))
+        self._persist_db(f"Vendor renamed: {v} -> {new}")
+        self._persist_issues(f"Vendor config renamed: {v} -> {new}")
+
+        cur_issue = self.issue_var.get()
+        cur_detail = self.detail_var.get()
+
+        issues = self._get_vendor_issues(new)
+        if cur_issue not in issues:
+            cur_issue = issues[0] if issues else ""
+
+        details = list(self.db.get(new, {}).get(cur_issue, {}).keys()) if cur_issue else []
+        if cur_detail not in details:
+            cur_detail = "_COMMON" if "_COMMON" in details else (details[0] if details else "_COMMON")
+
+        self._sync_vendor_scoped_config_with_db()
+        self.build_nav_tree(select_default=True, restore_path=(new, cur_issue, cur_detail))
+        self.log(f"Vendor renamed: {v} -> {new}")
 
     # --------------------------------------------------------
     # Issue CRUD (Vendor-scoped)
@@ -2524,67 +2669,4 @@ class KeywordGuideApp(tk.Tk):
     # UI State
     # --------------------------------------------------------
     def _apply_saved_widths(self):
-        cols = self.ui_state.get("keyword_tree_cols", {}) if isinstance(self.ui_state, dict) else {}
-        for c, w in cols.items():
-            if c in DEFAULT_KEYWORD_COL_WIDTHS and c in KEYWORD_COLS:
-                try:
-                    self.tree.column(c, width=int(w))
-                except Exception:
-                    pass
-
-        try:
-            w0 = (self.ui_state.get("keyword_tree_col0_width", 34) if isinstance(self.ui_state, dict) else 34)
-            self.tree.column("#0", width=int(w0))
-        except Exception:
-            pass
-
-        pcols = self.ui_state.get("param_tree_cols", {}) if isinstance(self.ui_state, dict) else {}
-        for c, w in pcols.items():
-            if c in DEFAULT_PARAM_COL_WIDTHS:
-                try:
-                    self.param_tree.column(c, width=int(w))
-                except Exception:
-                    pass
-
-    def reset_ui_layout(self):
-        self.geometry(DEFAULT_GEOMETRY)
-        for c, w in DEFAULT_KEYWORD_COL_WIDTHS.items():
-            if c in KEYWORD_COLS:
-                self.tree.column(c, width=w)
-        try:
-            self.tree.column("#0", width=34)
-        except Exception:
-            pass
-        for c, w in DEFAULT_PARAM_COL_WIDTHS.items():
-            self.param_tree.column(c, width=w)
-        self.log("UI layout reset to defaults.")
-
-    def on_close(self):
-        # store open state one last time (ensures latest)
-        self._store_nav_open_state()
-        open_iids = self.ui_state.get("nav_open_iids", []) if isinstance(self.ui_state, dict) else []
-
-        nav_path = {"vendor": self.vendor_var.get(), "issue": self.issue_var.get(), "detail": self.detail_var.get()}
-
-        state = {
-            "geometry": self.geometry(),
-            "nav_path": nav_path,
-            "nav_open_iids": open_iids,  # (FIX) persisted open state
-            "keyword_tree_col0_width": self.tree.column("#0", "width"),
-            "keyword_tree_cols": {c: self.tree.column(c, "width") for c in KEYWORD_COLS},
-            "param_tree_cols": {c: self.param_tree.column(c, "width") for c in DEFAULT_PARAM_COL_WIDTHS},
-        }
-
-        # persist (robust)
-        self._persist_ui_state("UI state saved", state)
-        self._persist_db("DB saved")
-        self._persist_issues("Issue config saved")
-        self.destroy()
-
-
-if __name__ == "__main__":
-    try:
-        KeywordGuideApp().mainloop()
-    except Exception:
-        # 마지막 안전망: 예외를 stdout에 남김
-        print("Fatal error:\n", traceback.format_exc())
+        cols = self.ui_state.get("
