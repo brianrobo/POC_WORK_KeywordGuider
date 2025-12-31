@@ -1,46 +1,46 @@
 # ============================================================
 # Keyword Guide UI POC
 # ------------------------------------------------------------
-# Version: 0.5.3 (2025-12-31)
+# Version: 0.5.4 (2025-12-31)
 #
-# Release Notes (v0.5.3)
-# - (UI) Navigation Tree open/close 상태(nav_open_iids) 저장/복원
-#        - 여러 군데 펼쳐둔 상태 그대로 유지(A 방식)
-# - (I/O) 저장 안정성 강화(WinError 5 등) : tmp write + os.replace + retry/backoff
-# - (UI) KeywordDialog 마우스휠 바인딩 부작용 패치(bind_all 제거, widget-local bind)
-# - (UI) KeywordDialog Description에 스크롤바 추가(내용이 창 height 초과 시 스크롤)
-# - (UX) 로그성 메시지(시간 포함) status bar에 표시 + 콘솔 print
+# Release Notes (v0.5.4)
+# - (FIX) Navigation Tree 펼침/접힘 상태가 앱 재실행 후 유지되지 않던 문제 수정
+#        - build_nav_tree()에서 open=True 강제 적용 제거
+#        - ui_state.json에 nav_open_iids 저장/복원
+#        - 선택된 노드가 보이도록 “선택 경로 조상만” 최소 open 처리(사용자 open 상태는 그대로 유지)
+# - (I/O) 저장 안정성(WinError 5 방지) 적용
+#        - JSON 저장 시 tmp -> os.replace + retry/backoff
+#        - 실패 시 autosave 파일로 fallback 저장
+# - (UI) KeywordDialog: 마우스휠 바인딩 부작용(전체 bind_all/unbind_all) 제거
+#        - parts_canvas에만 wheel 이벤트 바인딩(플랫폼별 처리)
+# - (UI) KeywordDialog: Description 영역에 스크롤바 추가(내용 길어도 스크롤 가능)
+# - (LOG) 간단한 로그 패널 추가(시간 포함 메시지 누적) + status bar 연동
 #
 # Existing (v0.5.0 유지)
-# - Window title에 release version 표시
-# - Copy: params 치환 Copy / No Params(CopyNP)
-# - Keyword "Group" 필드
-# - Keyword Description Rich Text (Bold + 3 Colors) with desc_rich runs
-# - Keyword List: 왼쪽(#0) 체크박스 + extended selection
-# - Select All / Clear All / Copy Selected / Copy Selected NP
-# - Up/Down(단일 선택 1개 기준) 위치 변경
-# - Vendor별 Issue 관리 + Vendor별 Delimiter 저장
+# - Navigation Tree (Vendor/Issue/Detail)
+# - Export / Import (Replace ONLY)
+# - Copy / CopyNP, Bulk copy, Checkbox + extended selection
+# - Up/Down(단일 선택 1개) 위치 변경
+# - Keyword Group, Desc rich(Bold + 3 colors), Parts UI + preview wrap/scroll
 # - Placeholder detect + Inline Apply (category-level params)
 # - UI state persistence
-# - KeywordDialog: Parts fixed height + scroll, Preview wrap+scroll
-# - Import Joined String split UX: confirm
-# - Part 입력 중 delimiter 포함 시 split 제안: confirm(자동 아님)
-# - Export / Import(Replace only)
 # ============================================================
 
 import json
+import os
 import re
 import time
-import os
+import traceback
 from pathlib import Path
 from datetime import datetime
 import tkinter as tk
 from tkinter import ttk, messagebox, simpledialog, filedialog
+from tkinter.scrolledtext import ScrolledText
 
 # ------------------------------------------------------------
 # Paths / Constants
 # ------------------------------------------------------------
-APP_VERSION = "0.5.3"
+APP_VERSION = "0.5.4"
 
 BASE_DIR = Path(__file__).resolve().parent
 DB_PATH = BASE_DIR / "keywords_db.json"
@@ -48,7 +48,7 @@ UI_STATE_PATH = BASE_DIR / "ui_state.json"
 ISSUES_PATH = BASE_DIR / "issues_config.json"
 
 PLACEHOLDER_RE = re.compile(r"\{([A-Za-z0-9_]+)\}")
-DEFAULT_GEOMETRY = "1280x780"
+DEFAULT_GEOMETRY = "1280x800"
 
 # Keyword list view: Summary | Group | Info | Copy | CopyNP | Preview
 KEYWORD_COLS = ("summary", "group", "info", "copy", "copynp", "preview")
@@ -79,7 +79,49 @@ EXPORT_SCHEMA_VERSION = "1.0"
 
 
 # ------------------------------------------------------------
-# Utility: Safe JSON I/O (WinError 5 방지)
+# Robust Save (WinError 5 mitigation)
+# ------------------------------------------------------------
+def _safe_write_json(path: Path, data: dict, retries: int = 7, base_sleep: float = 0.06) -> tuple[bool, str]:
+    """
+    Windows 환경에서 간헐적으로 발생하는 PermissionError(WinError 5) 대응:
+    - tmp 파일에 쓰고 os.replace로 원자 교체
+    - retry/backoff
+    - 실패 시 autosave 파일로 fallback
+    """
+    try:
+        txt = json.dumps(data, indent=2, ensure_ascii=False)
+    except Exception as e:
+        return False, f"json.dumps failed: {e}"
+
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    autosave = path.with_suffix(path.suffix + f".autosave_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
+
+    last_err = None
+    for n in range(retries):
+        try:
+            tmp.write_text(txt, encoding="utf-8")
+            os.replace(str(tmp), str(path))
+            return True, "OK"
+        except PermissionError as e:
+            last_err = e
+            # backoff
+            time.sleep(base_sleep * (1.6 ** n))
+            continue
+        except Exception as e:
+            last_err = e
+            time.sleep(base_sleep * (1.4 ** n))
+            continue
+
+    # fallback autosave
+    try:
+        autosave.write_text(txt, encoding="utf-8")
+        return False, f"Primary save failed ({last_err}); wrote fallback: {autosave.name}"
+    except Exception as e:
+        return False, f"Primary save failed ({last_err}); autosave failed ({e})"
+
+
+# ------------------------------------------------------------
+# Utility
 # ------------------------------------------------------------
 def load_json(path: Path):
     if not path.exists():
@@ -91,37 +133,8 @@ def load_json(path: Path):
         return {}
 
 
-def _safe_write_text(path: Path, text: str, encoding: str = "utf-8", retries: int = 6):
-    """
-    Windows에서 종종 발생하는 PermissionError(WinError 5) 대비:
-    - tmp 파일에 먼저 쓰고
-    - os.replace로 원자적 교체 시도
-    - 실패 시 backoff 재시도
-    """
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-
-    last_err = None
-    for n in range(retries):
-        try:
-            tmp.write_text(text, encoding=encoding)
-            os.replace(str(tmp), str(path))
-            return
-        except Exception as e:
-            last_err = e
-            # tmp 정리 시도
-            try:
-                if tmp.exists():
-                    tmp.unlink()
-            except Exception:
-                pass
-            time.sleep(0.05 * (2 ** n))
-
-    raise last_err
-
-
-def save_json(path: Path, data: dict):
-    _safe_write_text(path, json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+def save_json(path: Path, data: dict) -> tuple[bool, str]:
+    return _safe_write_json(path, data)
 
 
 def detect_placeholders(text: str):
@@ -324,10 +337,10 @@ def validate_import_package(pkg: dict) -> tuple[bool, str]:
 # ------------------------------------------------------------
 class KeywordDialog(tk.Toplevel):
     """
-    - Parts: fixed height + scroll
+    - Parts: scrollable
     - Preview: wrap + scroll
-    - Description: rich text (bold + colors) + scrollbar (v0.5.3)
-    - Mousewheel binding: widget-local (no bind_all side effects) (v0.5.3)
+    - Desc: rich (bold + color) + scrollbar
+    - Mousewheel: bind to parts_canvas only (no bind_all/unbind_all side effects)
     """
     def __init__(self, parent, title, init=None, delimiter=";"):
         super().__init__(parent)
@@ -356,7 +369,6 @@ class KeywordDialog(tk.Toplevel):
         ent_grp.grid(row=3, column=0, sticky="ew", pady=(2, 10))
 
         ttk.Label(frm, text=f"Import Joined String (delimiter: '{self.delimiter}')").grid(row=4, column=0, sticky="w")
-
         import_row = ttk.Frame(frm)
         import_row.grid(row=5, column=0, sticky="ew", pady=(2, 10))
         import_row.columnconfigure(0, weight=1)
@@ -394,9 +406,8 @@ class KeywordDialog(tk.Toplevel):
         self.parts_container.bind("<Configure>", self._on_parts_container_configure)
         self.parts_canvas.bind("<Configure>", self._on_parts_canvas_configure)
 
-        # mousewheel (widget-local, no bind_all)
-        self._bind_mousewheel_local(self.parts_canvas)
-        self._bind_mousewheel_local(self.parts_container)
+        # Mousewheel binding: attach only to parts_canvas
+        self._bind_mousewheel_to_canvas(self.parts_canvas)
 
         add_btn_row = ttk.Frame(frm)
         add_btn_row.grid(row=8, column=0, sticky="w", pady=(0, 8))
@@ -423,15 +434,15 @@ class KeywordDialog(tk.Toplevel):
         self.preview_text.configure(yscrollcommand=self.preview_scroll.set)
 
         ttk.Label(frm, text="Description (Bold + Color, Info 팝업으로 표시)").grid(row=11, column=0, sticky="w")
+
         desc_toolbar = ttk.Frame(frm)
         desc_toolbar.grid(row=12, column=0, sticky="w", pady=(4, 2))
-
         ttk.Button(desc_toolbar, text="B", width=3, command=self._toggle_bold).pack(side=tk.LEFT, padx=(0, 8))
         ttk.Button(desc_toolbar, text="Black", command=lambda: self._apply_color("black")).pack(side=tk.LEFT, padx=2)
         ttk.Button(desc_toolbar, text="Red", command=lambda: self._apply_color("red")).pack(side=tk.LEFT, padx=2)
         ttk.Button(desc_toolbar, text="Blue", command=lambda: self._apply_color("blue")).pack(side=tk.LEFT, padx=2)
 
-        # Description box + scrollbar (v0.5.3)
+        # Description box + scrollbar
         desc_box = ttk.Frame(frm)
         desc_box.grid(row=13, column=0, sticky="nsew", pady=(2, 10))
         desc_box.columnconfigure(0, weight=1)
@@ -439,6 +450,7 @@ class KeywordDialog(tk.Toplevel):
 
         self.txt_desc = tk.Text(desc_box, height=10, wrap="word")
         self.txt_desc.grid(row=0, column=0, sticky="nsew")
+
         desc_sb = ttk.Scrollbar(desc_box, orient="vertical", command=self.txt_desc.yview)
         desc_sb.grid(row=0, column=1, sticky="ns", padx=(6, 0))
         self.txt_desc.configure(yscrollcommand=desc_sb.set)
@@ -456,6 +468,7 @@ class KeywordDialog(tk.Toplevel):
         frm.columnconfigure(0, weight=1)
         frm.rowconfigure(13, weight=1)
 
+        # initial parts
         initial_parts = keyword_parts_from_kw(init, self.delimiter)
         if not initial_parts:
             initial_parts = [""]
@@ -495,20 +508,24 @@ class KeywordDialog(tk.Toplevel):
         except Exception:
             pass
 
-    # -----------------------------
-    # Mousewheel (widget-local)
-    # -----------------------------
-    def _bind_mousewheel_local(self, widget):
-        # Windows/macOS: MouseWheel, Linux: Button-4/5
-        widget.bind("<MouseWheel>", self._on_mousewheel, add="+")
-        widget.bind("<Button-4>", self._on_mousewheel_linux, add="+")
-        widget.bind("<Button-5>", self._on_mousewheel_linux, add="+")
+    # -------- mouse wheel (no global bind_all) --------
+    def _bind_mousewheel_to_canvas(self, canvas: tk.Canvas):
+        # Windows / macOS
+        canvas.bind("<MouseWheel>", self._on_mousewheel_windows_mac, add="+")
+        # Linux
+        canvas.bind("<Button-4>", self._on_mousewheel_linux, add="+")
+        canvas.bind("<Button-5>", self._on_mousewheel_linux, add="+")
+        # Trackpad (mac sometimes uses Shift+MouseWheel variants)
+        canvas.bind("<Shift-MouseWheel>", self._on_mousewheel_windows_mac, add="+")
 
-    def _on_mousewheel(self, event):
+    def _on_mousewheel_windows_mac(self, event):
         try:
-            # event.delta is typically 120 increments on Windows
-            delta = int(-1 * (event.delta / 120))
-            self.parts_canvas.yview_scroll(delta, "units")
+            # event.delta: Windows 120 step, macOS can be small deltas
+            delta = event.delta
+            if delta == 0:
+                return
+            step = int(-1 * (delta / 120)) if abs(delta) >= 120 else (-1 if delta > 0 else 1)
+            self.parts_canvas.yview_scroll(step, "units")
         except Exception:
             pass
 
@@ -521,9 +538,7 @@ class KeywordDialog(tk.Toplevel):
         except Exception:
             pass
 
-    # -----------------------------
-    # Parts rows
-    # -----------------------------
+    # -------- parts & preview --------
     def _add_part_row(self, initial_text=""):
         row = ttk.Frame(self.parts_container)
         row.pack(fill=tk.X, pady=2)
@@ -600,9 +615,6 @@ class KeywordDialog(tk.Toplevel):
         except Exception:
             pass
 
-    # -----------------------------
-    # Preview
-    # -----------------------------
     def _set_preview_text(self, text: str):
         self.preview_text.configure(state="normal")
         self.preview_text.delete("1.0", "end")
@@ -617,9 +629,6 @@ class KeywordDialog(tk.Toplevel):
         joined = self.delimiter.join(self._get_parts())
         self._set_preview_text(joined)
 
-    # -----------------------------
-    # Split offer
-    # -----------------------------
     def _split_by_delimiter(self, text: str) -> list[str]:
         delim = self.delimiter if self.delimiter is not None else DEFAULT_DELIMITER
         delim = str(delim)
@@ -705,9 +714,7 @@ class KeywordDialog(tk.Toplevel):
         finally:
             self._split_offer_inflight = False
 
-    # -----------------------------
-    # Rich text ops
-    # -----------------------------
+    # -------- desc rich --------
     def _get_sel_range(self):
         try:
             start = self.txt_desc.index("sel.first")
@@ -736,7 +743,6 @@ class KeywordDialog(tk.Toplevel):
         if rng:
             self._toggle_tag("b", rng[0], rng[1])
             return
-
         start = self.txt_desc.index("insert linestart")
         end = self.txt_desc.index("insert lineend")
         self._toggle_tag("b", start, end)
@@ -806,9 +812,6 @@ class KeywordDialog(tk.Toplevel):
             if c in DESC_COLOR_KEYS:
                 self.txt_desc.tag_add(f"c_{c}", start, end)
 
-    # -----------------------------
-    # OK/Cancel
-    # -----------------------------
     def _ok(self):
         parts = self._get_parts()
         if not parts:
@@ -941,6 +944,9 @@ class KeywordGuideApp(tk.Tk):
         self._copy_feedback_after_id = None
         self._copy_feedback_row = None
 
+        # nav open state cache
+        self._nav_open_set = set()
+
         self.geometry(self.ui_state.get("geometry", DEFAULT_GEOMETRY) if isinstance(self.ui_state, dict) else DEFAULT_GEOMETRY)
         self._build_ui()
         self._make_checkbox_images()
@@ -951,21 +957,24 @@ class KeywordGuideApp(tk.Tk):
         self._init_nav_default_selection()
         self._ensure_current_obj_migrated()
 
-        self.log("App started.")
         self.protocol("WM_DELETE_WINDOW", self.on_close)
 
     # --------------------------------------------------------
-    # Logging (status + console)
+    # Logging
     # --------------------------------------------------------
     def log(self, msg: str):
         ts = datetime.now().strftime("%H:%M:%S")
         line = f"[{ts}] {msg}"
         try:
-            self.status_var.set(line)
+            self.status_var.set(msg)
         except Exception:
             pass
         try:
-            print(line)
+            if self.log_text:
+                self.log_text.configure(state="normal")
+                self.log_text.insert("end", line + "\n")
+                self.log_text.see("end")
+                self.log_text.configure(state="disabled")
         except Exception:
             pass
 
@@ -1016,17 +1025,24 @@ class KeywordGuideApp(tk.Tk):
     def _persist_issues(self, msg: str):
         try:
             self.issue_cfg = ensure_issue_config_vendor_scoped(self.issue_cfg, list(self.db.keys()))
-            save_json(ISSUES_PATH, self.issue_cfg)
-            self.log(msg)
+            ok, smsg = save_json(ISSUES_PATH, self.issue_cfg)
+            self.log(msg + ("" if ok else f" (WARN: {smsg})"))
         except Exception as e:
             self.log(f"Issue config save failed: {e}")
 
     def _persist_db(self, msg: str):
         try:
-            save_json(DB_PATH, self.db)
-            self.log(msg)
+            ok, smsg = save_json(DB_PATH, self.db)
+            self.log(msg + ("" if ok else f" (WARN: {smsg})"))
         except Exception as e:
             self.log(f"Save failed: {e}")
+
+    def _persist_ui_state(self, msg: str, state: dict):
+        try:
+            ok, smsg = save_json(UI_STATE_PATH, state)
+            self.log(msg + ("" if ok else f" (WARN: {smsg})"))
+        except Exception as e:
+            self.log(f"UI state save failed: {e}")
 
     def _sync_vendor_scoped_config_with_db(self):
         if not isinstance(self.db, dict):
@@ -1113,9 +1129,9 @@ class KeywordGuideApp(tk.Tk):
 
         self.nav_tree.bind("<<TreeviewSelect>>", self.on_nav_select)
 
-        # v0.5.3: open/close 상태 저장
-        self.nav_tree.bind("<<TreeviewOpen>>", self.on_nav_open_close)
-        self.nav_tree.bind("<<TreeviewClose>>", self.on_nav_open_close)
+        # track open/close to keep in-memory set (optional but helps)
+        self.nav_tree.bind("<<TreeviewOpen>>", self._on_nav_open_close)
+        self.nav_tree.bind("<<TreeviewClose>>", self._on_nav_open_close)
 
         # Vendor delimiter
         ttk.Label(left, text="Keyword Delimiter (Selected Vendor)").pack(anchor="w", pady=(10, 0))
@@ -1146,6 +1162,13 @@ class KeywordGuideApp(tk.Tk):
         io_box.pack(fill=tk.X, pady=(10, 0))
         ttk.Button(io_box, text="Export...", command=self.export_data).pack(fill=tk.X, padx=6, pady=(6, 2))
         ttk.Button(io_box, text="Import (Replace)...", command=self.import_data_replace).pack(fill=tk.X, padx=6, pady=(2, 6))
+
+        # Log panel
+        log_box = ttk.LabelFrame(left, text="Log")
+        log_box.pack(fill=tk.BOTH, expand=True, pady=(10, 0))
+        self.log_text = ScrolledText(log_box, height=8, wrap="word")
+        self.log_text.pack(fill=tk.BOTH, expand=True, padx=6, pady=6)
+        self.log_text.configure(state="disabled")
 
         # RIGHT: Keyword + Params
         right = ttk.Frame(root)
@@ -1282,70 +1305,108 @@ class KeywordGuideApp(tk.Tk):
             pass
         return "", "", "", ""
 
-    # v0.5.3: open state store/restore
-    def on_nav_open_close(self, _event=None):
+    def _open_ancestors(self, iid: str):
+        """선택 노드가 보이도록 부모 체인만 open=True로 만든다."""
         try:
-            self._store_nav_open_state()
+            cur = iid
+            while cur:
+                parent = self.nav_tree.parent(cur)
+                if not parent:
+                    break
+                self.nav_tree.item(parent, open=True)
+                cur = parent
         except Exception:
             pass
 
     def _store_nav_open_state(self):
-        if not isinstance(self.ui_state, dict):
-            self.ui_state = {}
-        open_iids = []
+        """현재 nav_tree에서 open=True인 iid를 ui_state에 반영"""
+        open_ids = []
 
-        def walk(parent=""):
-            for iid in self.nav_tree.get_children(parent):
+        def walk(node=""):
+            for child in self.nav_tree.get_children(node):
                 try:
-                    if self.nav_tree.item(iid, "open"):
-                        open_iids.append(iid)
+                    if bool(self.nav_tree.item(child, "open")):
+                        open_ids.append(child)
                 except Exception:
                     pass
-                walk(iid)
+                walk(child)
 
-        walk("")
-        self.ui_state["nav_open_iids"] = open_iids
+        try:
+            walk("")
+        except Exception:
+            pass
+
+        if not isinstance(self.ui_state, dict):
+            self.ui_state = {}
+        self.ui_state["nav_open_iids"] = open_ids
+        self._nav_open_set = set(open_ids)
 
     def _restore_nav_open_state(self):
-        if not isinstance(self.ui_state, dict):
-            return
-        open_iids = self.ui_state.get("nav_open_iids", [])
-        if not isinstance(open_iids, list) or not open_iids:
-            return
-        for iid in open_iids:
+        """ui_state의 nav_open_iids를 nav_tree에 적용"""
+        open_ids = []
+        if isinstance(self.ui_state, dict):
+            open_ids = self.ui_state.get("nav_open_iids", [])
+        if not isinstance(open_ids, list):
+            open_ids = []
+
+        self._nav_open_set = set(open_ids)
+        for iid in open_ids:
             try:
                 if self.nav_tree.exists(iid):
                     self.nav_tree.item(iid, open=True)
             except Exception:
                 pass
 
+    def _on_nav_open_close(self, _event=None):
+        """사용자가 열고 닫을 때 in-memory set 업데이트 (종료 저장 시에도 사용)"""
+        try:
+            sel = self.nav_tree.focus()
+            if not sel:
+                return
+            is_open = bool(self.nav_tree.item(sel, "open"))
+            if is_open:
+                self._nav_open_set.add(sel)
+            else:
+                if sel in self._nav_open_set:
+                    self._nav_open_set.remove(sel)
+        except Exception:
+            pass
+
     def build_nav_tree(self, select_default=True, restore_path=None):
-        """Rebuild full navigation tree (vendors/issues/details). Optionally restore selection."""
+        """
+        Rebuild full navigation tree (vendors/issues/details).
+        - open 상태는 insert에서 강제하지 않고, build 후 restore_nav_open_state()로만 복원
+        """
+        # cache current open state before rebuild (optional but good)
+        try:
+            self._store_nav_open_state()
+        except Exception:
+            pass
+
         self.nav_tree.delete(*self.nav_tree.get_children(""))
         vendors = list(self.db.keys()) if isinstance(self.db, dict) else []
         if not vendors:
             self.db = self._default_db()
             vendors = list(self.db.keys())
 
-        # normalize cfg with vendors
         self.issue_cfg = ensure_issue_config_vendor_scoped(self.issue_cfg, vendors)
 
         for v in vendors:
             vid = self._nav_iid_vendor(v)
-            self.nav_tree.insert("", "end", iid=vid, text=v, open=True)
+            # (FIX) open=True 강제 제거
+            self.nav_tree.insert("", "end", iid=vid, text=v, open=False)
 
             issues = self._get_vendor_issues(v)
-            # fallback to db keys if config empty
             if not issues and isinstance(self.db.get(v), dict):
                 issues = list(self.db[v].keys())
             for issue in issues:
                 iid = self._nav_iid_issue(v, issue)
-                self.nav_tree.insert(vid, "end", iid=iid, text=issue, open=True)
+                # (FIX) open=True 강제 제거
+                self.nav_tree.insert(vid, "end", iid=iid, text=issue, open=False)
 
                 self.db.setdefault(v, {})
                 self.db[v].setdefault(issue, self._default_issue_obj())
                 details = list(self.db[v][issue].keys())
-                # keep _COMMON first if exists
                 if "_COMMON" in details:
                     details = ["_COMMON"] + [x for x in details if x != "_COMMON"]
 
@@ -1353,7 +1414,7 @@ class KeywordGuideApp(tk.Tk):
                     did = self._nav_iid_detail(v, issue, d)
                     self.nav_tree.insert(iid, "end", iid=did, text=d, open=False)
 
-        # v0.5.3: restore open/close state (A 방식)
+        # (FIX) build 끝난 뒤 open 상태 복원
         self._restore_nav_open_state()
 
         # restore selection
@@ -1375,6 +1436,8 @@ class KeywordGuideApp(tk.Tk):
 
             if target:
                 try:
+                    # 선택 노드 보이게 조상만 open (A 방식 훼손하지 않음)
+                    self._open_ancestors(target)
                     self.nav_tree.selection_set(target)
                     self.nav_tree.see(target)
                     self._apply_nav_selection(target)
@@ -1383,7 +1446,6 @@ class KeywordGuideApp(tk.Tk):
                     pass
 
         if select_default:
-            # choose first vendor/issue/_COMMON
             if vendors:
                 v = vendors[0]
                 issues = self._get_vendor_issues(v)
@@ -1396,6 +1458,7 @@ class KeywordGuideApp(tk.Tk):
                     if not self.nav_tree.exists(target):
                         target = self._nav_iid_issue(v, i)
                     try:
+                        self._open_ancestors(target)
                         self.nav_tree.selection_set(target)
                         self.nav_tree.see(target)
                         self._apply_nav_selection(target)
@@ -1403,12 +1466,18 @@ class KeywordGuideApp(tk.Tk):
                         pass
 
     def _init_nav_default_selection(self):
-        # try restore from ui_state path
         restore = None
         if isinstance(self.ui_state, dict):
             p = self.ui_state.get("nav_path", None)
             if isinstance(p, dict):
                 restore = (p.get("vendor", ""), p.get("issue", ""), p.get("detail", ""))
+
+        # preload nav open state from ui_state
+        if isinstance(self.ui_state, dict):
+            o = self.ui_state.get("nav_open_iids", [])
+            if isinstance(o, list):
+                self._nav_open_set = set(o)
+
         self.build_nav_tree(select_default=True, restore_path=restore)
 
     def on_nav_select(self, _event=None):
@@ -1601,7 +1670,7 @@ class KeywordGuideApp(tk.Tk):
         self.clear_inline()
 
         v, i, d = self.vendor_var.get(), self.issue_var.get(), self.detail_var.get()
-        self.log(f"Selected: {v} > {i} > {d}")
+        self.status_var.set(f"Selected: {v} > {i} > {d}")
 
     def refresh_keywords(self):
         self._clear_copy_feedback(force=True)
@@ -1816,7 +1885,7 @@ class KeywordGuideApp(tk.Tk):
         combined = delim.join(rendered_list)
         self.clipboard_clear()
         self.clipboard_append(combined)
-        self.log(f"Copied Selected ({len(rendered_list)})")
+        self.log(f"Copied Selected ({len(rendered_list)}): {combined}")
 
     def copy_selected_keywords_no_params(self):
         joined_list = self._collect_selected_joined_templates()
@@ -1835,7 +1904,7 @@ class KeywordGuideApp(tk.Tk):
         combined = delim.join(rendered_list)
         self.clipboard_clear()
         self.clipboard_append(combined)
-        self.log(f"Copied Selected NP ({len(rendered_list)})")
+        self.log(f"Copied Selected NP ({len(rendered_list)}): {combined}")
 
     # --------------------------------------------------------
     # Keyword CRUD
@@ -2011,14 +2080,14 @@ class KeywordGuideApp(tk.Tk):
             self.clipboard_clear()
             self.clipboard_append(rendered)
             self._show_copy_feedback(row, which="copy")
-            self.log("Copied (with params).")
+            self.log(f"Copied: {rendered}")
 
         elif col == "#5":  # CopyNP (without params)
             rendered = render_keyword_without_params(raw_joined)
             self.clipboard_clear()
             self.clipboard_append(rendered)
             self._show_copy_feedback(row, which="copynp")
-            self.log("Copied NP (no params).")
+            self.log(f"Copied NP: {rendered}")
 
     def on_tree_double_click(self, event):
         col = self.tree.identify_column(event.x)
@@ -2376,7 +2445,7 @@ class KeywordGuideApp(tk.Tk):
             return
 
         try:
-            _safe_write_text(Path(path), json.dumps(pkg, indent=2, ensure_ascii=False), encoding="utf-8")
+            Path(path).write_text(json.dumps(pkg, indent=2, ensure_ascii=False), encoding="utf-8")
             self.log(f"Exported: {path}")
         except Exception as e:
             messagebox.showerror("Export Failed", str(e))
@@ -2491,36 +2560,31 @@ class KeywordGuideApp(tk.Tk):
         self.log("UI layout reset to defaults.")
 
     def on_close(self):
-        # v0.5.3: persist nav open state into ui_state first
-        try:
-            self._store_nav_open_state()
-        except Exception:
-            pass
+        # store open state one last time (ensures latest)
+        self._store_nav_open_state()
+        open_iids = self.ui_state.get("nav_open_iids", []) if isinstance(self.ui_state, dict) else []
 
         nav_path = {"vendor": self.vendor_var.get(), "issue": self.issue_var.get(), "detail": self.detail_var.get()}
 
         state = {
             "geometry": self.geometry(),
             "nav_path": nav_path,
-            "nav_open_iids": (self.ui_state.get("nav_open_iids", []) if isinstance(self.ui_state, dict) else []),
+            "nav_open_iids": open_iids,  # (FIX) persisted open state
             "keyword_tree_col0_width": self.tree.column("#0", "width"),
             "keyword_tree_cols": {c: self.tree.column(c, "width") for c in KEYWORD_COLS},
             "param_tree_cols": {c: self.param_tree.column(c, "width") for c in DEFAULT_PARAM_COL_WIDTHS},
         }
 
-        try:
-            save_json(UI_STATE_PATH, state)
-            save_json(DB_PATH, self.db)
-            self._persist_issues("Issue config saved")
-        except Exception as e:
-            # 마지막 종료 시에도 에러가 나면 UI가 닫히지 않는 문제 방지
-            try:
-                print(f"[on_close] save failed: {e}")
-            except Exception:
-                pass
-
+        # persist (robust)
+        self._persist_ui_state("UI state saved", state)
+        self._persist_db("DB saved")
+        self._persist_issues("Issue config saved")
         self.destroy()
 
 
 if __name__ == "__main__":
-    KeywordGuideApp().mainloop()
+    try:
+        KeywordGuideApp().mainloop()
+    except Exception:
+        # 마지막 안전망: 예외를 stdout에 남김
+        print("Fatal error:\n", traceback.format_exc())
